@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import asyncio
 import random
 import discord
@@ -757,6 +758,47 @@ def is_dm_blocked(user_id) -> bool:
     return str(user_id) in _load_dm_blocked()
 
 
+# --- In-flight check-in lock ---
+# Prevents a user from starting two parallel flows (e.g. clicking the channel
+# button AND running /checkin in DM at the same time). Per-process in-memory:
+# a bot restart drops the locks and the user can simply start again. Together
+# with the per-week has_checked_in() guard and the re-check inside submit, this
+# gives three layers of duplicate protection.
+#
+# Locks carry a TTL so a member who abandons mid-flow (closes the modal, ignores
+# the DM, etc.) isn't permanently blocked — they roll off after CHECKIN_LOCK_TTL
+# seconds. The conversational flow releases explicitly via release_checkin_lock
+# in its finally block; the modal flow releases on successful submit. The TTL is
+# the safety net for everything else.
+CHECKIN_LOCK_TTL = 1800  # 30 minutes
+_inflight_checkins: dict[int, float] = {}
+
+
+def acquire_checkin_lock(user_id: int) -> bool:
+    """Try to claim the in-flight slot for this user. Returns False only if
+    a fresh (within TTL) flow is already running."""
+    now = time.time()
+    started = _inflight_checkins.get(user_id)
+    if started is not None and now - started < CHECKIN_LOCK_TTL:
+        return False
+    _inflight_checkins[user_id] = now
+    return True
+
+
+def release_checkin_lock(user_id: int) -> None:
+    _inflight_checkins.pop(user_id, None)
+
+
+def is_checkin_in_flight(user_id: int) -> bool:
+    started = _inflight_checkins.get(user_id)
+    if started is None:
+        return False
+    if time.time() - started >= CHECKIN_LOCK_TTL:
+        _inflight_checkins.pop(user_id, None)
+        return False
+    return True
+
+
 # --- Member product info persistence ---
 # Once a member tells us their product name + link, we cache it locally and
 # never ask again. Future check-ins include the saved info in the task
@@ -1138,10 +1180,23 @@ async def _resolve_coach_mentions_async(guild: discord.Guild, coach_labels: list
     return " ".join(mentions)
 
 
-async def post_public_checkin_confirmation(client: discord.Client, user: discord.User) -> None:
-    """Post a short, non-sensitive confirmation in the member's 1-1 ticket channel (visible to everyone there).
+async def post_checkin_to_ticket_channel(
+    client: discord.Client,
+    user: discord.User,
+    *,
+    answers: dict | None = None,
+    completed_in_channel_id: int | None = None,
+) -> None:
+    """Post a check-in summary in the member's 1-1 ticket channel.
 
-    Tags coaches from the ClickUp Member Database Coach field when they match a member of the guild (CSM ping).
+    - If the check-in was completed in the ticket channel itself
+      (`completed_in_channel_id` matches), post a short confirmation since the
+      raw answers are already visible above.
+    - Otherwise (DM modal flow, or /checkin run from a non-ticket channel),
+      post the FULL raw answers so the coach sees what the member wrote.
+
+    Tags coaches from the ClickUp Member Database Coach field when they match
+    a member of the guild.
     """
     flag = os.getenv("CHECKIN_TICKET_CONFIRM", "true").lower()
     if flag in ("0", "false", "no", "off"):
@@ -1173,21 +1228,81 @@ async def post_public_checkin_confirmation(client: discord.Client, user: discord
             labels = _coach_assignee_labels(member_task)
             coach_ping = await _resolve_coach_mentions_async(guild, labels)
 
-        body = (
-            f"{user.mention} **Check-in received** — thanks! Your coaching team "
-            "will review this to help you make progress."
-        )
+        if completed_in_channel_id == channel.id:
+            # Conversational flow happened right here — coach already saw the
+            # whole thing scroll by. Just give them a ping + done marker.
+            body = (
+                f"{user.mention} ✅ **Check-in saved to ClickUp.** "
+                "Your coaching team will review this to help you make progress."
+            )
+        elif answers:
+            # DM modal (or external-channel) flow — surface the raw answers so
+            # the coach sees what the member wrote.
+            product = get_product_info(user.name)
+            product_lines = ""
+            if product and (product.get("product_name") or product.get("product_link")):
+                product_lines = (
+                    f"**Product:** {product.get('product_name') or '—'}\n"
+                    f"**Product Link:** {product.get('product_link') or '—'}\n\n"
+                )
+            body = (
+                f"{user.mention} **Weekly check-in submitted**\n\n"
+                f"**Stage:** {answers['stage']}\n"
+                f"**Hours this week:** {answers['weekly_hours']}\n"
+                f"**Feeling:** {answers['feeling']}\n"
+                f"**Weeks in stage:** {answers['weeks']}\n\n"
+                f"{product_lines}"
+                f"**Blocker:** {answers['blocker']}\n\n"
+                f"**Support that would help:** {answers['help_needed']}\n\n"
+                f"**ONE key thing this week:** {answers['next_steps']}"
+            )
+        else:
+            # No answers provided and not posted from this channel — fall back
+            # to the legacy short confirmation.
+            body = (
+                f"{user.mention} **Check-in received** — thanks! Your coaching "
+                "team will review this to help you make progress."
+            )
+
         if coach_ping:
             body = f"{coach_ping}\n{body}"
 
-        await channel.send(body)
-        print(f"[TICKET] Posted confirmation in #{channel.name}")
+        # Body may exceed Discord's 2000-char per-message limit if a member
+        # writes a novel. Split conservatively on paragraph boundaries.
+        for chunk in _split_for_discord(body):
+            await channel.send(chunk)
+        print(f"[TICKET] Posted check-in summary in #{channel.name}")
     except discord.Forbidden:
         print(f"[TICKET] Missing permission to post in ticket channel for {user.name!r}")
     except discord.HTTPException as e:
         print(f"[TICKET] Discord HTTP error posting confirmation: {e}")
     except Exception as e:
         print(f"[TICKET] Error posting confirmation: {e}")
+
+
+def _split_for_discord(text: str, limit: int = 1900) -> list[str]:
+    """Split a long message into chunks under Discord's 2000-char limit,
+    preferring paragraph boundaries."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        # Find last paragraph break before the limit
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut < limit // 2:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+# Backwards-compat alias for any callers still referring to the old name.
+post_public_checkin_confirmation = post_checkin_to_ticket_channel
 
 
 # --- Check-in Modal (the popup form) ---
@@ -1224,124 +1339,171 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Build ClickUp task
-        today = datetime.now().strftime("%b %d, %Y")
-        hours_band = weekly_hours_band_for_label(self.weekly_hours)
-        headers = {
-            "Authorization": CLICKUP_TOKEN,
-            "Content-Type": "application/json",
-        }
-        base_custom_fields = [
-            {"id": CI_FIELD_MEMBER, "value": interaction.user.display_name},
-            {"id": CI_FIELD_DATE, "value": today},
-            {"id": CI_FIELD_STAGE, "value": self.selected_stage},
-            {"id": CI_FIELD_WEEKS_IN_STAGE, "value": self.weeks.value},
-            {"id": CI_FIELD_WEEK, "value": datetime.now().isocalendar()[1]},
-            {"id": CI_FIELD_BLOCKER, "value": self.blocker.value},
-            {"id": CI_FIELD_WHAT_WOULD_HELP, "value": self.help_needed.value},
-            {"id": CI_FIELD_NEXT_STEPS, "value": self.next_steps.value},
-        ]
-
-        # Pull saved product info (if any) so it shows on every check-in task
-        product = get_product_info(interaction.user.name)
-        product_lines = ""
-        if product:
-            pname = product.get("product_name") or ""
-            plink = product.get("product_link") or ""
-            if pname or plink:
-                product_lines = (
-                    f"**Product:** {pname}\n\n"
-                    f"**Product Link:** {plink}\n\n"
-                )
-
         # Respond to Discord immediately (must be within 3 seconds)
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        cu_status = None
-        checkin_task_id = None
         try:
-            async with aiohttp.ClientSession() as session:
-                wh_meta = await get_weekly_hours_field_meta(session)
-                custom_fields = list(base_custom_fields)
-                wh_entry = weekly_hours_custom_field_entry(
-                    wh_meta, hours_band, self.weekly_hours,
-                )
-                if wh_entry:
-                    custom_fields.append(wh_entry)
-                task_data = {
-                    "name": f"Check-in — {interaction.user.display_name} — {today}",
-                    "description": (
-                        f"**Member:** {interaction.user.display_name}\n"
-                        f"**Discord Username:** {interaction.user.name}\n"
-                        f"**Date:** {today}\n\n"
-                        f"---\n\n"
-                        f"**Stage:** {self.selected_stage}\n\n"
-                        f"{product_lines}"
-                        f"**Hours Spent This Week:** {self.weekly_hours}\n\n"
-                        f"**Weeks in Stage:** {self.weeks.value}\n\n"
-                        f"**Feeling About Progress:** {self.feeling}\n\n"
-                        f"**Blocker:** {self.blocker.value}\n\n"
-                        f"**Support That Would Help:** {self.help_needed.value}\n\n"
-                        f"**ONE Key Thing This Week:** {self.next_steps.value}"
-                    ),
-                    "priority": 3,
-                    "tags": ["check-in", interaction.user.name],
-                    "custom_fields": custom_fields,
-                }
-                async with session.post(
-                    f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
-                    json=task_data,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    cu_status = resp.status
-                    if cu_status == 200:
-                        resp_data = await resp.json()
-                        checkin_task_id = resp_data.get("id")
-                    else:
-                        body = await resp.text()
-                        print(f"[ERROR] ClickUp API: {cu_status} — {body}")
-
-            if cu_status == 200:
-                # Record that this user checked in this week
-                record_checkin(interaction.user.id)
-                # Clear DM-blocked flag if they managed to check in
-                unmark_dm_blocked(interaction.user.id)
-
+            # Idempotency: if a parallel flow already recorded a check-in
+            # (e.g. user somehow opened both DM modal and a channel
+            # conversational flow), bail before creating a duplicate ClickUp
+            # task.
+            if has_checked_in(interaction.user.id):
                 await interaction.followup.send(
-                    "Thanks for checking in — clarity creates momentum 💪\n"
-                    "Your coaching team will review this to help you make progress 👊",
+                    "Looks like you already checked in this week — no duplicate created.",
                     ephemeral=True,
                 )
-                print(f"[OK] Check-in from {interaction.user.display_name}")
+                return
 
-                # Update member profile + enrich check-in task in background
-                asyncio.create_task(_update_member_after_checkin(
-                    discord_username=interaction.user.name,
-                    display_name=interaction.user.display_name,
-                    stage=self.selected_stage,
-                    weeks=self.weeks.value,
-                    blocker=self.blocker.value,
-                    help_needed=self.help_needed.value,
-                    next_steps=self.next_steps.value,
-                    checkin_task_id=checkin_task_id,
-                ))
-                # Short public note in their 1-1 ticket channel (no form details)
-                asyncio.create_task(post_public_checkin_confirmation(
-                    interaction.client,
-                    interaction.user,
-                ))
-            else:
+            ok, _task_id, err = await submit_checkin(
+                user=interaction.user,
+                stage=self.selected_stage,
+                weekly_hours=self.weekly_hours,
+                feeling=self.feeling,
+                weeks=self.weeks.value,
+                blocker=self.blocker.value,
+                help_needed=self.help_needed.value,
+                next_steps=self.next_steps.value,
+            )
+
+            if not ok:
+                print(f"[ERROR] modal submit failed: {err}")
                 await interaction.followup.send(
-                    "⚠️ Check-in received but there was an issue saving it. The team has been notified.",
+                    "⚠️ Something went wrong saving your check-in. Please try again in a moment.",
                     ephemeral=True,
                 )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"[ERROR] Request failed: {e}")
+                return
+
             await interaction.followup.send(
-                "⚠️ Something went wrong. Please try again in a moment.",
+                "Thanks for checking in — clarity creates momentum 💪\n"
+                "Your coaching team will review this to help you make progress 👊",
                 ephemeral=True,
             )
+            print(f"[OK] Check-in from {interaction.user.display_name}")
+
+            # DM modal flow: post the FULL raw answers in the user's 1-1
+            # ticket channel so the coach sees what they wrote (not just a
+            # generic "received" ping).
+            asyncio.create_task(post_checkin_to_ticket_channel(
+                interaction.client,
+                interaction.user,
+                answers={
+                    "stage": self.selected_stage,
+                    "weekly_hours": self.weekly_hours,
+                    "feeling": self.feeling,
+                    "weeks": self.weeks.value,
+                    "blocker": self.blocker.value,
+                    "help_needed": self.help_needed.value,
+                    "next_steps": self.next_steps.value,
+                },
+            ))
+        finally:
+            release_checkin_lock(interaction.user.id)
+
+
+async def submit_checkin(
+    *,
+    user,
+    stage: str,
+    weekly_hours: str,
+    feeling: str,
+    weeks: str,
+    blocker: str,
+    help_needed: str,
+    next_steps: str,
+):
+    """Build + POST a ClickUp check-in task. Records the check-in and schedules
+    the background member-profile enrichment.
+
+    Returns (ok: bool, checkin_task_id: str | None, error: str | None).
+    Shared by the modal flow (DM) and the conversational flow (1-1 channel).
+    """
+    today = datetime.now().strftime("%b %d, %Y")
+    hours_band = weekly_hours_band_for_label(weekly_hours)
+    headers = {
+        "Authorization": CLICKUP_TOKEN,
+        "Content-Type": "application/json",
+    }
+    display_name = getattr(user, "display_name", None) or user.name
+
+    base_custom_fields = [
+        {"id": CI_FIELD_MEMBER, "value": display_name},
+        {"id": CI_FIELD_DATE, "value": today},
+        {"id": CI_FIELD_STAGE, "value": stage},
+        {"id": CI_FIELD_WEEKS_IN_STAGE, "value": weeks},
+        {"id": CI_FIELD_WEEK, "value": datetime.now().isocalendar()[1]},
+        {"id": CI_FIELD_BLOCKER, "value": blocker},
+        {"id": CI_FIELD_WHAT_WOULD_HELP, "value": help_needed},
+        {"id": CI_FIELD_NEXT_STEPS, "value": next_steps},
+    ]
+
+    product = get_product_info(user.name)
+    product_lines = ""
+    if product:
+        pname = product.get("product_name") or ""
+        plink = product.get("product_link") or ""
+        if pname or plink:
+            product_lines = (
+                f"**Product:** {pname}\n\n"
+                f"**Product Link:** {plink}\n\n"
+            )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            wh_meta = await get_weekly_hours_field_meta(session)
+            custom_fields = list(base_custom_fields)
+            wh_entry = weekly_hours_custom_field_entry(wh_meta, hours_band, weekly_hours)
+            if wh_entry:
+                custom_fields.append(wh_entry)
+            task_data = {
+                "name": f"Check-in — {display_name} — {today}",
+                "description": (
+                    f"**Member:** {display_name}\n"
+                    f"**Discord Username:** {user.name}\n"
+                    f"**Date:** {today}\n\n"
+                    f"---\n\n"
+                    f"**Stage:** {stage}\n\n"
+                    f"{product_lines}"
+                    f"**Hours Spent This Week:** {weekly_hours}\n\n"
+                    f"**Weeks in Stage:** {weeks}\n\n"
+                    f"**Feeling About Progress:** {feeling}\n\n"
+                    f"**Blocker:** {blocker}\n\n"
+                    f"**Support That Would Help:** {help_needed}\n\n"
+                    f"**ONE Key Thing This Week:** {next_steps}"
+                ),
+                "priority": 3,
+                "tags": ["check-in", user.name],
+                "custom_fields": custom_fields,
+            }
+            async with session.post(
+                f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
+                json=task_data,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[ERROR] ClickUp API: {resp.status} — {body}")
+                    return False, None, f"ClickUp returned {resp.status}"
+                resp_data = await resp.json()
+                checkin_task_id = resp_data.get("id")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[ERROR] submit_checkin request failed: {e}")
+        return False, None, str(e)
+
+    record_checkin(user.id)
+    unmark_dm_blocked(user.id)
+
+    asyncio.create_task(_update_member_after_checkin(
+        discord_username=user.name,
+        display_name=display_name,
+        stage=stage,
+        weeks=weeks,
+        blocker=blocker,
+        help_needed=help_needed,
+        next_steps=next_steps,
+        checkin_task_id=checkin_task_id,
+    ))
+    return True, checkin_task_id, None
 
 
 async def _update_member_after_checkin(discord_username, display_name, stage,
@@ -1635,6 +1797,272 @@ class FeelingSelectView(discord.ui.View):
         self.add_item(FeelingSelect(selected_stage=selected_stage, weekly_hours=weekly_hours))
 
 
+# --- Conversational check-in flow (1-1 ticket channel + DM fallback) ---
+# Instead of a modal popup, the bot asks each question as its own message in
+# the channel. Structured fields use dropdowns; free-text fields wait for the
+# member's next message. Coach reads the whole conversation in real time.
+
+_CANCEL_TOKENS = {"cancel", "stop", "abort", "quit"}
+_CONVO_TIMEOUT_SECONDS = 1800  # 30 min per question; whole flow can sit idle
+
+
+class _SingleSelectView(discord.ui.View):
+    """Posts one dropdown, captures the picked value, stops the view. Only the
+    target user can interact."""
+
+    def __init__(self, *, user_id: int, options: list, placeholder: str):
+        super().__init__(timeout=_CONVO_TIMEOUT_SECONDS)
+        self.user_id = user_id
+        self.value: str | None = None
+        self.add_item(_AskSelect(options=options, placeholder=placeholder))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This check-in isn't for you — type `/checkin` to start your own.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+class _AskSelect(discord.ui.Select):
+    def __init__(self, *, options: list, placeholder: str):
+        super().__init__(
+            placeholder=placeholder,
+            options=[discord.SelectOption(label=l, value=v) for l, v in options],
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.value = self.values[0]
+        await interaction.response.defer()
+        self.view.stop()
+
+
+async def _ask_select(
+    *, user: discord.User, channel, prompt: str, options: list, placeholder: str,
+) -> str | None:
+    """Post a dropdown question and wait for the user to pick. Returns the
+    value, or None if they timed out."""
+    view = _SingleSelectView(user_id=user.id, options=options, placeholder=placeholder)
+    msg = await channel.send(prompt, view=view)
+    timed_out = await view.wait()
+    if timed_out or view.value is None:
+        try:
+            await msg.edit(content=f"{prompt}\n*(Timed out — run `/checkin` to start again.)*", view=None)
+        except discord.HTTPException:
+            pass
+        return None
+    # Lock in the picked value so it can't be re-selected.
+    try:
+        await msg.edit(content=f"{prompt}\n**You picked:** {view.value}", view=None)
+    except discord.HTTPException:
+        pass
+    return view.value
+
+
+async def _ask_text(
+    *,
+    client: discord.Client,
+    user: discord.User,
+    channel,
+    prompt: str,
+    max_length: int | None = None,
+    required: bool = True,
+) -> str | None:
+    """Post a free-text question and wait for the user's next message in this
+    channel. Returns the text, '' if optional + skipped, or None if cancelled /
+    timed out."""
+    suffix = "\n*Reply here — type `cancel` to abort, or `skip` to leave blank.*" if not required \
+        else "\n*Reply here — type `cancel` to abort.*"
+    await channel.send(f"{prompt}{suffix}")
+    while True:
+        try:
+            msg = await client.wait_for(
+                "message",
+                check=lambda m: m.author.id == user.id and m.channel.id == channel.id,
+                timeout=_CONVO_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await channel.send(
+                f"{user.mention} ⏰ Check-in timed out. Run `/checkin` when you're ready."
+            )
+            return None
+        text = (msg.content or "").strip()
+        low = text.lower()
+        if low in _CANCEL_TOKENS:
+            await channel.send(f"{user.mention} Check-in cancelled. Run `/checkin` whenever.")
+            return None
+        if not required and low in {"skip", "n/a", "none"}:
+            return ""
+        if not text:
+            if not required:
+                return ""
+            await channel.send("That came through empty — try again.")
+            continue
+        if max_length and len(text) > max_length:
+            await channel.send(
+                f"That's {len(text)} characters — try keeping it under {max_length}."
+            )
+            continue
+        return text
+
+
+async def run_conversational_checkin(
+    *,
+    client: discord.Client,
+    user: discord.User,
+    channel,
+) -> None:
+    """Walk the user through Stage → Hours → Feeling → (Product?) → Weeks →
+    Blocker → Help → Next-steps in `channel`. Posts to ClickUp on success.
+
+    The caller (`_dispatch_checkin_entry`) MUST have already acquired the
+    in-flight lock for this user. We release it unconditionally in `finally`.
+    """
+    try:
+        await channel.send(
+            f"👋 {user.mention} **Weekly coach check-in — let's go.**\n"
+            "I'll ask 7 quick questions. You can type `cancel` any time to bail out."
+        )
+
+        stage = await _ask_select(
+            user=user, channel=channel,
+            prompt="**1 / 7 — Which stage are you currently at?**",
+            options=STAGE_OPTIONS,
+            placeholder="Pick your stage",
+        )
+        if stage is None:
+            return
+
+        weekly_hours = await _ask_select(
+            user=user, channel=channel,
+            prompt="**2 / 7 — How much time did you dedicate this week?**",
+            options=HOURS_OPTIONS,
+            placeholder="Pick your hours",
+        )
+        if weekly_hours is None:
+            return
+
+        feeling = await _ask_select(
+            user=user, channel=channel,
+            prompt="**3 / 7 — How are you feeling about progress?**",
+            options=FEELING_OPTIONS,
+            placeholder="Pick the closest match",
+        )
+        if feeling is None:
+            return
+
+        # One-time product capture for stages 2+ if we haven't cached it yet.
+        if _stage_requires_product_info(stage) and not has_product_info(user.name):
+            product_name = await _ask_text(
+                client=client, user=user, channel=channel,
+                prompt="**Quick one-time question — what is your product called?**",
+                max_length=200,
+            )
+            if product_name is None:
+                return
+            product_link = await _ask_text(
+                client=client, user=user, channel=channel,
+                prompt="**Can you share a link?**  *(Optional — type `skip` if not yet.)*",
+                max_length=500,
+                required=False,
+            )
+            if product_link is None:
+                return
+            save_member_product_info(user.name, product_name, product_link)
+            asyncio.create_task(save_product_info_to_member_db(
+                user.name, product_name, product_link,
+            ))
+
+        weeks = await _ask_text(
+            client=client, user=user, channel=channel,
+            prompt="**4 / 7 — How many weeks have you been in this stage?**\n*e.g. `3`*",
+            max_length=10,
+        )
+        if weeks is None:
+            return
+
+        blocker = await _ask_text(
+            client=client, user=user, channel=channel,
+            prompt="**5 / 7 — What's blocking your progress right now?**\n*Be specific.*",
+            max_length=1000,
+        )
+        if blocker is None:
+            return
+
+        help_needed = await _ask_text(
+            client=client, user=user, channel=channel,
+            prompt="**6 / 7 — What kind of support would help you most?**\n*Be specific.*",
+            max_length=1000,
+        )
+        if help_needed is None:
+            return
+
+        next_steps = await _ask_text(
+            client=client, user=user, channel=channel,
+            prompt="**7 / 7 — The ONE key thing to get done this week?**\n*Be specific.*",
+            max_length=1000,
+        )
+        if next_steps is None:
+            return
+
+        # Race re-check: another flow (DM modal) may have submitted in parallel.
+        if has_checked_in(user.id):
+            await channel.send(
+                f"{user.mention} Looks like a check-in already landed for you this "
+                "week — skipping to avoid a duplicate."
+            )
+            return
+
+        await channel.send("Saving your check-in… 📋")
+        ok, _task_id, err = await submit_checkin(
+            user=user,
+            stage=stage,
+            weekly_hours=weekly_hours,
+            feeling=feeling,
+            weeks=weeks,
+            blocker=blocker,
+            help_needed=help_needed,
+            next_steps=next_steps,
+        )
+        if not ok:
+            print(f"[CONVO] submit failed: {err}")
+            await channel.send(
+                f"{user.mention} ⚠️ Something went wrong saving your check-in. "
+                "Try `/checkin` again in a moment."
+            )
+            return
+
+        await channel.send(
+            f"{user.mention} ✅ **Thanks for checking in — clarity creates momentum.** 💪"
+        )
+        print(f"[OK] Conversational check-in from {user.name}")
+
+        # Post the wrap-up to the 1-1 ticket channel. If the convo happened in
+        # that same channel, this just adds a coach @mention + done marker.
+        # If the convo happened elsewhere (DM fallback, /checkin in random
+        # channel), this posts the full raw answers there.
+        asyncio.create_task(post_checkin_to_ticket_channel(
+            client,
+            user,
+            answers={
+                "stage": stage,
+                "weekly_hours": weekly_hours,
+                "feeling": feeling,
+                "weeks": weeks,
+                "blocker": blocker,
+                "help_needed": help_needed,
+                "next_steps": next_steps,
+            },
+            completed_in_channel_id=channel.id,
+        ))
+    finally:
+        release_checkin_lock(user.id)
+
+
 # --- Button that opens the stage select ---
 class CheckInButton(discord.ui.View):
     def __init__(self):
@@ -1647,43 +2075,99 @@ class CheckInButton(discord.ui.View):
         custom_id="checkin_button",
     )
     async def start_checkin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = StageSelectView()
+        await _dispatch_checkin_entry(interaction)
+
+
+def _is_dm_channel(channel) -> bool:
+    """True if `channel` is a Discord DM (private or group-DM)."""
+    if channel is None:
+        return False
+    return channel.type in (discord.ChannelType.private, discord.ChannelType.group)
+
+
+async def _dispatch_checkin_entry(interaction: discord.Interaction) -> None:
+    """Shared entry point for both the button click and the /checkin slash
+    command. Routes by where the interaction happened:
+
+      - DM         → existing modal flow (3 ephemeral selects + popup form)
+      - Any guild  → conversational flow in that channel
+
+    This is the ONLY place that acquires the in-flight lock for a fresh flow.
+    Both downstream flows are responsible for releasing it in a `finally`.
+    """
+    # Already submitted this week?
+    if has_checked_in(interaction.user.id):
         await interaction.response.send_message(
-            "**Step 1 of 3 — Stage**\n"
-            "Pick the stage you're at. **Next** you'll pick **hours** and **how you're feeling**, "
-            "then the form opens.",
-            view=view,
+            "You've already checked in this week — see you next Monday. 👊",
             ephemeral=True,
         )
+        return
+
+    # Single lock acquire — closes the double-click race for both paths.
+    if not acquire_checkin_lock(interaction.user.id):
+        await interaction.response.send_message(
+            "You've already got a check-in open — finish that one first.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        if _is_dm_channel(interaction.channel):
+            # DM path: existing modal flow. Lock is released by
+            # CheckInModal.on_submit (or by TTL if the user abandons mid-flow).
+            await interaction.response.send_message(
+                "**Step 1 of 3 — Stage**\n"
+                "Pick the stage you're at. Next you'll pick **hours** and **how you're feeling**, "
+                "then the form opens.",
+                view=StageSelectView(),
+                ephemeral=True,
+            )
+            return
+
+        # Channel path: ack ephemerally to clear the button's loading state,
+        # then kick off the public conversation. run_conversational_checkin
+        # releases the lock in its own finally.
+        await interaction.response.send_message(
+            "Starting your check-in below — answer each question right here. 👇",
+            ephemeral=True,
+        )
+    except Exception:
+        # If we acquired the lock but couldn't even send the ack, release the
+        # lock so the user can retry. (Don't swallow the exception itself.)
+        release_checkin_lock(interaction.user.id)
+        raise
+
+    asyncio.create_task(run_conversational_checkin(
+        client=interaction.client,
+        user=interaction.user,
+        channel=interaction.channel,
+    ))
 
 
 # --- Slash command: /checkin ---
 @tree.command(name="checkin", description="Submit your weekly coach check-in")
 async def checkin_command(interaction: discord.Interaction):
-    view = StageSelectView()
-    await interaction.response.send_message(
-        "**Step 1 of 3 — Stage**\n"
-        "Pick the stage you're at. **Next** you'll pick **hours** and **how you're feeling**, "
-        "then the form opens.",
-        view=view,
-        ephemeral=True,
-    )
+    await _dispatch_checkin_entry(interaction)
 
 
 # --- Admin command: trigger check-in DMs now ---
-@tree.command(name="trigger_checkins", description="[Admin] Send check-in DMs to all eligible members now")
+@tree.command(name="trigger_checkins", description="[Admin] Send check-in reminders to all eligible members now")
 @app_commands.default_permissions(administrator=True)
 async def trigger_checkins(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         await _send_checkin_dms(
             "manual_trigger",
+            "{mention} 👋 **Weekly coach check-in.**\n"
+            "Hit **Start Check-in** below (or type `/checkin`) and I'll walk you "
+            "through 7 quick questions right here. Takes about 2 minutes.\n\n"
+            "*Your coaching team uses this to help you make progress.*",
             "**📋 Weekly Coach Check-in**\n\n"
-            "Time for your weekly coach check-in.\n"
-            "Click the button below to share where you're at.\n\n"
+            "Time for your weekly coach check-in. Click **Start Check-in** below "
+            "to share where you're at — takes about 2 minutes.\n\n"
             "*Your coaching team uses this to help you make progress.*",
         )
-        await interaction.followup.send("✅ Check-in DMs sent!", ephemeral=True)
+        await interaction.followup.send("✅ Check-in reminders sent!", ephemeral=True)
     except Exception as e:
         print(f"[ERROR] trigger_checkins: {e}")
         await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
@@ -2110,23 +2594,35 @@ monday_time = datetime.now(et).replace(hour=9, minute=0, second=0).timetz()
 wednesday_time = datetime.now(et).replace(hour=12, minute=0, second=0).timetz()
 
 
-async def _send_checkin_dms(label: str, message: str):
-    """Shared logic: DM members who haven't checked in this week.
+async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | None = None):
+    """Post the weekly / midweek check-in reminder to each eligible member.
 
-    Anti-spam measures:
+    Routing: post in the member's 1-1 ticket channel (with @mention + the
+    Start Check-in button) when one exists; otherwise fall back to DM. The
+    ticket channel is the same one the bot already posts confirmations into —
+    `<ticket#>-<discord_username>`, e.g. `69-michaelralston92`.
+
+    `channel_message` is the body posted in the ticket channel (uses @mention
+    for notification). `dm_message` is the body posted in DM fallback — if
+    omitted, channel_message is reused.
+
+    Anti-spam measures (DM path only):
     - Random jitter between DMs (DM_DELAY_MIN to DM_DELAY_MAX seconds)
     - Batch pausing (DM_BATCH_PAUSE seconds every DM_BATCH_SIZE messages)
     - Skip users with DMs disabled (persistent tracking)
     - Exponential backoff on 429 rate limits
     - Cross-guild deduplication
     """
+    dm_message = dm_message or channel_message
     accelerate_usernames = await fetch_accelerate_usernames()
     excluded_ids = await fetch_excluded_user_ids()
     pending = load_pending()
-    sent = 0
+    sent_channel = 0
+    sent_dm = 0
     skipped = 0
     dm_blocked = 0
     ineligible = 0
+    no_channel = 0
     seen_users = set()  # Dedupe across guilds
 
     for guild in client.guilds:
@@ -2134,7 +2630,6 @@ async def _send_checkin_dms(label: str, message: str):
             if member.bot or member.id in seen_users:
                 continue
             seen_users.add(member.id)
-            # Only DM members in ClickUp Accelerate program + within join window
             if member.name.lower() not in accelerate_usernames:
                 continue
             if not is_within_join_window(member):
@@ -2147,20 +2642,42 @@ async def _send_checkin_dms(label: str, message: str):
             if has_checked_in(member.id):
                 skipped += 1
                 continue
+
+            # 1-1 ticket channel preferred. Coach sees the reminder land and
+            # the conversational flow happens right there.
+            candidates = _ticket_channels_for_username(guild, member.name.lower())
+            ticket_channel = _pick_ticket_channel_for_confirmation(candidates)
+
+            if ticket_channel is not None:
+                try:
+                    body = channel_message.format(mention=member.mention)
+                    await ticket_channel.send(body, view=CheckInButton())
+                    sent_channel += 1
+                    print(f"[CHANNEL] Sent {label} to #{ticket_channel.name} for {member.display_name}")
+                    # Channel posts have their own per-channel rate limit; a
+                    # short pause is enough.
+                    await asyncio.sleep(1.0)
+                    continue
+                except discord.Forbidden:
+                    print(f"[CHANNEL] No permission to post in #{ticket_channel.name} — falling back to DM")
+                except discord.HTTPException as e:
+                    print(f"[CHANNEL] HTTP error posting in #{ticket_channel.name}: {e} — falling back to DM")
+                except Exception as e:
+                    print(f"[CHANNEL] Error posting in #{ticket_channel.name}: {e} — falling back to DM")
+
+            # DM fallback.
+            no_channel += 1
             if is_dm_blocked(member.id):
                 dm_blocked += 1
                 continue
             try:
-                view = CheckInButton()
-                await member.send(message, view=view)
-                sent += 1
+                await member.send(dm_message, view=CheckInButton())
+                sent_dm += 1
                 print(f"[DM] Sent {label} to {member.display_name}")
-                # Batch pause: longer break every N messages
-                if sent % DM_BATCH_SIZE == 0:
-                    print(f"[PACE] Batch pause after {sent} DMs ({DM_BATCH_PAUSE}s)")
+                if sent_dm % DM_BATCH_SIZE == 0:
+                    print(f"[PACE] Batch pause after {sent_dm} DMs ({DM_BATCH_PAUSE}s)")
                     await asyncio.sleep(DM_BATCH_PAUSE)
                 else:
-                    # Random jitter between DMs to look natural
                     await asyncio.sleep(random.uniform(DM_DELAY_MIN, DM_DELAY_MAX))
             except discord.Forbidden:
                 mark_dm_blocked(member.id)
@@ -2176,7 +2693,12 @@ async def _send_checkin_dms(label: str, message: str):
             except Exception as e:
                 print(f"[ERROR] DM to {member.display_name}: {e}")
 
-    print(f"[{label.upper()}] Sent: {sent}, Skipped (checked in): {skipped}, DM-blocked: {dm_blocked}, Join-date filtered: {ineligible}")
+    print(
+        f"[{label.upper()}] Channel: {sent_channel}, DM: {sent_dm} "
+        f"(of {no_channel} with no ticket channel), "
+        f"Skipped (checked in): {skipped}, DM-blocked: {dm_blocked}, "
+        f"Join-date filtered: {ineligible}"
+    )
 
 
 @tasks.loop(time=monday_time)
@@ -2185,9 +2707,15 @@ async def weekly_reminder():
         return
     await _send_checkin_dms(
         "weekly",
+        # Channel version — uses {mention} to ping the member.
+        "{mention} 👋 **Weekly coach check-in.**\n"
+        "Hit **Start Check-in** below (or type `/checkin`) and I'll walk you "
+        "through 7 quick questions right here. Takes about 2 minutes.\n\n"
+        "*Your coaching team uses this to help you make progress.*",
+        # DM fallback — no @mention needed in a DM.
         "**\U0001f4cb Weekly Coach Check-in**\n\n"
-        "Time for your weekly coach check-in.\n"
-        "Click the button below to share where you're at.\n\n"
+        "Time for your weekly coach check-in. Click **Start Check-in** below "
+        "to share where you're at — takes about 2 minutes.\n\n"
         "*Your coaching team uses this to help you make progress.*",
     )
 
@@ -2198,9 +2726,15 @@ async def midweek_reminder():
         return
     await _send_checkin_dms(
         "midweek",
+        # Channel \u2014 coach can see the nudge land.
+        "{mention} \ud83d\udd14 **Still need your check-in this week.**\n"
+        "Hit **Start Check-in** below or type `/checkin` \u2014 2 minutes and your "
+        "coach has what they need.\n\n"
+        "*Your coaching team uses this to help you make progress.*",
+        # DM fallback.
         "**\U0001f514 Midweek Reminder**\n\n"
-        "You haven't submitted your coach check-in yet this week.\n"
-        "Click below to share your update \u2014 it only takes a minute.\n\n"
+        "You haven't submitted your coach check-in yet this week. Click "
+        "**Start Check-in** below to share your update \u2014 only takes a minute.\n\n"
         "*Your coaching team uses this to help you make progress.*",
     )
 
