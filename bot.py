@@ -1030,11 +1030,26 @@ async def save_product_info_to_member_db(discord_username: str,
 _TICKET_CHANNEL_NAME_RE = re.compile(r"^(\d+)-(.+)$")
 
 
+def _normalize_handle(s: str) -> str:
+    """Reduce a Discord username / channel-name segment to a comparable core:
+    lowercase, keep only [a-z0-9]. Discord channel names can't contain '.',
+    spaces or most punctuation, so a username like 'john.doe' becomes the
+    channel segment 'johndoe' (or 'john-doe'). Normalizing both sides lets them
+    match instead of silently failing — which previously meant no 1-1 ticket
+    post and no reminder routed for anyone with punctuation in their handle."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
 def _ticket_channels_for_username(guild: discord.Guild, username_lower: str) -> list[discord.TextChannel]:
+    target_exact = (username_lower or "").lower()
+    target_norm = _normalize_handle(username_lower)
     found = []
     for ch in guild.text_channels:
         m = _TICKET_CHANNEL_NAME_RE.match(ch.name.strip())
-        if m and m.group(2).lower() == username_lower:
+        if not m:
+            continue
+        seg = m.group(2)
+        if seg.lower() == target_exact or (target_norm and _normalize_handle(seg) == target_norm):
             found.append(ch)
     return found
 
@@ -1400,6 +1415,79 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
             release_checkin_lock(interaction.user.id)
 
 
+async def _find_checkin_task_by_name(session, headers, task_name):
+    """Return the id of an existing check-in task with this exact name created
+    today, else None. Lets us avoid creating a duplicate when a slow ClickUp
+    response timed out on our side *after* the task was actually saved."""
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    since_ms = int(midnight.timestamp() * 1000)
+    try:
+        async with session.get(
+            f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
+            params={"include_closed": "true", "subtasks": "false", "date_created_gt": since_ms},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+    target = (task_name or "").strip()
+    for t in data.get("tasks", []):
+        if (t.get("name") or "").strip() == target:
+            return t.get("id")
+    return None
+
+
+async def _create_checkin_task(session, headers, task_data):
+    """POST a check-in task to ClickUp, hardened against the failure mode that
+    showed members 'something went wrong' even though the task actually saved:
+
+    - 30s timeout (ClickUp occasionally responds slowly; 10s was too tight),
+    - retries on transient errors (timeout / connection / 429 / 5xx),
+    - idempotency: before re-POSTing, and once more at the end, check whether a
+      prior attempt already created the task so we never duplicate a check-in.
+
+    Returns (task_id, error_str)."""
+    url = f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task"
+    task_name = task_data.get("name", "")
+    max_attempts = 3
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            existing = await _find_checkin_task_by_name(session, headers, task_name)
+            if existing:
+                print(f"[CHECKIN] Prior attempt had saved it — reusing {existing} (no duplicate)")
+                return existing, None
+        try:
+            async with session.post(
+                url, json=task_data, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("id"), None
+                body = await resp.text()
+                last_err = f"ClickUp returned {resp.status}"
+                print(f"[ERROR] ClickUp API (attempt {attempt}/{max_attempts}): {resp.status} — {body[:300]}")
+                if resp.status not in (429, 500, 502, 503, 504):
+                    return None, last_err  # non-transient (auth/bad field) — retry won't help
+                ra = resp.headers.get("Retry-After", "")
+                await asyncio.sleep(float(ra) if ra.replace(".", "", 1).isdigit() else 2 * attempt)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = str(e) or type(e).__name__
+            print(f"[ERROR] submit_checkin request failed (attempt {attempt}/{max_attempts}): {last_err}")
+            if attempt < max_attempts:
+                await asyncio.sleep(2 * attempt)
+    # Out of attempts: the final POST may have saved before the response timed out.
+    recovered = await _find_checkin_task_by_name(session, headers, task_name)
+    if recovered:
+        print(f"[CHECKIN] Task saved despite errors — recovered {recovered}")
+        return recovered, None
+    return None, last_err or "save failed after retries"
+
+
 async def submit_checkin(
     *,
     user,
@@ -1474,20 +1562,11 @@ async def submit_checkin(
                 "tags": ["check-in", user.name],
                 "custom_fields": custom_fields,
             }
-            async with session.post(
-                f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/task",
-                json=task_data,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    print(f"[ERROR] ClickUp API: {resp.status} — {body}")
-                    return False, None, f"ClickUp returned {resp.status}"
-                resp_data = await resp.json()
-                checkin_task_id = resp_data.get("id")
+            checkin_task_id, err = await _create_checkin_task(session, headers, task_data)
+            if not checkin_task_id:
+                return False, None, err
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"[ERROR] submit_checkin request failed: {e}")
+        print(f"[ERROR] submit_checkin session error: {e}")
         return False, None, str(e)
 
     record_checkin(user.id)
