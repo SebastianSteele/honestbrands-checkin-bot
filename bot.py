@@ -179,6 +179,11 @@ CHECKIN_DATA_FILE = os.path.join(STATE_DIR, "checkin_data.json")
 # File to track users who have DMs disabled (skip them instead of retrying)
 DM_BLOCKED_FILE = os.path.join(STATE_DIR, "dm_blocked.json")
 
+# File to record which scheduled reminders have fired today — used by
+# reminder_dispatcher to be idempotent across bot restarts. Maps
+# {"weekly": "YYYY-MM-DD", "midweek": "YYYY-MM-DD"}.
+REMINDER_FIRES_FILE = os.path.join(STATE_DIR, "reminder_fires.json")
+
 # Stages where follow-up DMs stop (from check-in form selection).
 # Both the new 6-stage labels and the legacy 5-stage labels are listed so
 # previously submitted check-ins still mark the member as advanced.
@@ -797,6 +802,33 @@ def is_checkin_in_flight(user_id: int) -> bool:
         _inflight_checkins.pop(user_id, None)
         return False
     return True
+
+
+# --- Reminder fire tracking (persistent, restart-safe) ---
+def _load_reminder_fires() -> dict:
+    if os.path.exists(REMINDER_FIRES_FILE):
+        try:
+            with open(REMINDER_FIRES_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_reminder_fires(data: dict) -> None:
+    with open(REMINDER_FIRES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def already_fired_today(kind: str, date_iso: str) -> bool:
+    """True if `kind` ('weekly' or 'midweek') was already fired on `date_iso`."""
+    return _load_reminder_fires().get(kind) == date_iso
+
+
+def mark_fired_today(kind: str, date_iso: str) -> None:
+    data = _load_reminder_fires()
+    data[kind] = date_iso
+    _save_reminder_fires(data)
 
 
 # --- Member product info persistence ---
@@ -2669,8 +2701,14 @@ async def check_pending_members():
 
 # --- Auto-DM tasks (for existing members with accelerate/core roles) ---
 et = ZoneInfo("America/New_York")
-monday_time = datetime.now(et).replace(hour=9, minute=0, second=0).timetz()
-wednesday_time = datetime.now(et).replace(hour=12, minute=0, second=0).timetz()
+
+# Scheduled reminder slots, evaluated by reminder_dispatcher every 5 min in ET.
+# Polling design avoids the discord.py + ZoneInfo `time.utcoffset() is None`
+# subtlety that made the previous `@tasks.loop(time=...)` schedule hard to debug.
+REMINDER_WEEKLY_WEEKDAY  = 0   # Monday
+REMINDER_WEEKLY_HOUR     = 9   # 9 AM ET
+REMINDER_MIDWEEK_WEEKDAY = 2   # Wednesday
+REMINDER_MIDWEEK_HOUR    = 12  # 12 PM ET
 
 
 async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | None = None):
@@ -2780,51 +2818,69 @@ async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | 
     )
 
 
-@tasks.loop(time=monday_time)
-async def weekly_reminder():
-    if datetime.now(et).weekday() != 0:
-        return
-    await _send_checkin_dms(
-        "weekly",
-        # Channel version — uses {mention} to ping the member.
-        "{mention} 👋 **Weekly coach check-in.**\n"
-        "Hit **Start Check-in** below (or type `/checkin`) and I'll walk you "
-        "through 7 quick questions right here. Takes about 2 minutes.\n\n"
-        "*Your coaching team uses this to help you make progress.*",
-        # DM fallback — no @mention needed in a DM.
-        "**\U0001f4cb Weekly Coach Check-in**\n\n"
-        "Time for your weekly coach check-in. Click **Start Check-in** below "
-        "to share where you're at — takes about 2 minutes.\n\n"
-        "*Your coaching team uses this to help you make progress.*",
-    )
+# --- Reminder copy (channel + DM variants) ---
+_WEEKLY_CHANNEL_MSG = (
+    "{mention} 👋 **Weekly coach check-in.**\n"
+    "Hit **Start Check-in** below (or type `/checkin`) and I'll walk you "
+    "through 7 quick questions right here. Takes about 2 minutes.\n\n"
+    "*Your coaching team uses this to help you make progress.*"
+)
+_WEEKLY_DM_MSG = (
+    "**📋 Weekly Coach Check-in**\n\n"
+    "Time for your weekly coach check-in. Click **Start Check-in** below "
+    "to share where you're at — takes about 2 minutes.\n\n"
+    "*Your coaching team uses this to help you make progress.*"
+)
+_MIDWEEK_CHANNEL_MSG = (
+    "{mention} 🔔 **Still need your check-in this week.**\n"
+    "Hit **Start Check-in** below or type `/checkin` — 2 minutes and your "
+    "coach has what they need.\n\n"
+    "*Your coaching team uses this to help you make progress.*"
+)
+_MIDWEEK_DM_MSG = (
+    "**🔔 Midweek Reminder**\n\n"
+    "You haven't submitted your coach check-in yet this week. Click "
+    "**Start Check-in** below to share your update — only takes a minute.\n\n"
+    "*Your coaching team uses this to help you make progress.*"
+)
 
 
-@tasks.loop(time=wednesday_time)
-async def midweek_reminder():
-    if datetime.now(et).weekday() != 2:
-        return
-    await _send_checkin_dms(
-        "midweek",
-        # Channel \u2014 coach can see the nudge land.
-        "{mention} \ud83d\udd14 **Still need your check-in this week.**\n"
-        "Hit **Start Check-in** below or type `/checkin` \u2014 2 minutes and your "
-        "coach has what they need.\n\n"
-        "*Your coaching team uses this to help you make progress.*",
-        # DM fallback.
-        "**\U0001f514 Midweek Reminder**\n\n"
-        "You haven't submitted your coach check-in yet this week. Click "
-        "**Start Check-in** below to share your update \u2014 only takes a minute.\n\n"
-        "*Your coaching team uses this to help you make progress.*",
-    )
+@tasks.loop(minutes=5)
+async def reminder_dispatcher():
+    """Single dispatcher for weekly + midweek reminders.
+
+    Polls every 5 min, checks the current weekday + hour in ET, and fires
+    the appropriate reminder once per day (idempotent via persistent
+    fire-tracker). Replaces the previous tasks.loop(time=...) pair, which
+    depended on tz-aware time objects whose utcoffset() returns None for
+    ZoneInfo — making fire timing hard to reason about.
+
+    With this design:
+      - bot restarts during the firing hour still trigger the reminder
+      - bot restarts AFTER firing don't re-fire (persistent state)
+      - every fire writes a [REMINDER] Firing X at <ts> log line so the
+        actual decision time is visible in production logs
+    """
+    now_et = datetime.now(et)
+    date_iso = now_et.date().isoformat()
+    weekday = now_et.weekday()
+    hour = now_et.hour
+
+    if weekday == REMINDER_WEEKLY_WEEKDAY and hour == REMINDER_WEEKLY_HOUR:
+        if not already_fired_today("weekly", date_iso):
+            mark_fired_today("weekly", date_iso)
+            print(f"[REMINDER] Firing WEEKLY at {now_et.isoformat(timespec='seconds')}")
+            await _send_checkin_dms("weekly", _WEEKLY_CHANNEL_MSG, _WEEKLY_DM_MSG)
+
+    if weekday == REMINDER_MIDWEEK_WEEKDAY and hour == REMINDER_MIDWEEK_HOUR:
+        if not already_fired_today("midweek", date_iso):
+            mark_fired_today("midweek", date_iso)
+            print(f"[REMINDER] Firing MIDWEEK at {now_et.isoformat(timespec='seconds')}")
+            await _send_checkin_dms("midweek", _MIDWEEK_CHANNEL_MSG, _MIDWEEK_DM_MSG)
 
 
-@weekly_reminder.before_loop
-async def before_weekly_reminder():
-    await client.wait_until_ready()
-
-
-@midweek_reminder.before_loop
-async def before_midweek_reminder():
+@reminder_dispatcher.before_loop
+async def before_reminder_dispatcher():
     await client.wait_until_ready()
 
 
@@ -2976,10 +3032,8 @@ async def on_ready():
 
     # Start background tasks if not already running (skip in test mode)
     if not TEST_MODE:
-        if not weekly_reminder.is_running():
-            weekly_reminder.start()
-        if not midweek_reminder.is_running():
-            midweek_reminder.start()
+        if not reminder_dispatcher.is_running():
+            reminder_dispatcher.start()
         if not check_pending_members.is_running():
             check_pending_members.start()
         if not scan_new_accelerate_members.is_running():
