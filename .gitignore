@@ -17,3 +17,7 @@ exports/
 # Operational artifacts (handoff CSVs, ad-hoc debug scripts) — never deploy.
 missing_discord_usernames.csv
 debug_clickup.py
+
+# local read-only tooling caches (member PII — never commit)
+.discord_roster_cache.json
+.match_proposals.json
