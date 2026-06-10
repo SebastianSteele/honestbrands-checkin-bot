@@ -82,6 +82,13 @@ CI_FIELD_STAGE = "2e00e59d-ac4a-401e-b632-b90ec44962b2"
 CI_FIELD_WEEK = "7160ff5a-8278-4d17-8c71-b9c13f04a1a6"
 CI_FIELD_WEEKS_IN_STAGE = "2710fa28-d9bd-4462-b9c6-b8e346144518"
 CI_FIELD_WHAT_WOULD_HELP = "074c35ab-2ad6-466c-ab8e-685aea688d86"
+# Number field on the check-in list — which step of the roadmap checklist the
+# member says they're on this week (free-text answer parsed to an int).
+CI_FIELD_ROADMAP_STEP = "3d8f6bbd-18bb-4e24-91cb-0cbf93f6b2c9"
+# ClickUp made this a Space-level field, so the SAME id is attached to the
+# Member Database list too — the member's current step mirrors onto their
+# contact card via update_member_profile().
+CU_FIELD_ROADMAP_STEP = CI_FIELD_ROADMAP_STEP
 
 # Map bot stages to ClickUp Milestone dropdown options. Until a "Launched Ads"
 # milestone is added in ClickUp, "4. Launched Ads" maps to "3. Make Ads".
@@ -917,7 +924,8 @@ async def find_member_by_discord(discord_username: str):
 
 async def update_member_profile(task_id: str, stage: str,
                                 weeks: str = "", blocker: str = "",
-                                what_would_help: str = "", next_steps: str = ""):
+                                what_would_help: str = "", next_steps: str = "",
+                                roadmap_step: str = ""):
     """Update a member's ClickUp profile after a check-in submission."""
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
     now_ms = int(datetime.now().timestamp() * 1000)
@@ -954,6 +962,11 @@ async def update_member_profile(task_id: str, stage: str,
                 await _set_field(CU_FIELD_WEEKS_IN_STAGE, float(weeks), "Weeks in Stage")
             except ValueError:
                 errors.append(f"Weeks in Stage: invalid number '{weeks}'")
+
+        # Update Roadmap Step (number field) — member's current step this week
+        step_num = _parse_step_number(roadmap_step)
+        if step_num is not None:
+            await _set_field(CU_FIELD_ROADMAP_STEP, step_num, "Roadmap Step")
 
         # Update Blocker
         if blocker:
@@ -1295,7 +1308,8 @@ async def post_checkin_to_ticket_channel(
             body = (
                 f"{user.mention} **Weekly check-in submitted**\n\n"
                 f"**Stage:** {answers['stage']}\n"
-                f"**Hours this week:** {answers['weekly_hours']}\n"
+                f"**Roadmap step:** {answers.get('roadmap_step') or '—'}\n"
+                f"**Hours last week:** {answers['weekly_hours']}\n"
                 f"**Feeling:** {answers['feeling']}\n"
                 f"**Weeks in stage:** {answers['weeks']}\n\n"
                 f"{product_lines}"
@@ -1360,6 +1374,12 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
         self.weekly_hours = weekly_hours
         self.feeling = feeling
 
+    roadmap_step = discord.ui.TextInput(
+        label="What step # on the roadmap are you at?",
+        placeholder="e.g. 7",
+        style=discord.TextStyle.short,
+        max_length=10,
+    )
     weeks = discord.ui.TextInput(
         label="How many weeks have you been in this stage?",
         placeholder="e.g., 3",
@@ -1404,6 +1424,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
             ok, _task_id, err = await submit_checkin(
                 user=interaction.user,
                 stage=self.selected_stage,
+                roadmap_step=self.roadmap_step.value,
                 weekly_hours=self.weekly_hours,
                 feeling=self.feeling,
                 weeks=self.weeks.value,
@@ -1435,6 +1456,7 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
                 interaction.user,
                 answers={
                     "stage": self.selected_stage,
+                    "roadmap_step": self.roadmap_step.value,
                     "weekly_hours": self.weekly_hours,
                     "feeling": self.feeling,
                     "weeks": self.weeks.value,
@@ -1520,10 +1542,22 @@ async def _create_checkin_task(session, headers, task_data):
     return None, last_err or "save failed after retries"
 
 
+def _parse_step_number(raw: str):
+    """Pull the first integer out of a free-text roadmap-step answer so it can
+    go in the numeric ClickUp field. 'step 7' / '7' / '7-8' → 7; returns None
+    when there's no number, in which case the field is left unset rather than
+    erroring (the raw answer is still kept in the task description)."""
+    if not raw:
+        return None
+    m = re.search(r"\d+", str(raw))
+    return int(m.group()) if m else None
+
+
 async def submit_checkin(
     *,
     user,
     stage: str,
+    roadmap_step: str = "",
     weekly_hours: str,
     feeling: str,
     weeks: str,
@@ -1556,6 +1590,10 @@ async def submit_checkin(
         {"id": CI_FIELD_NEXT_STEPS, "value": next_steps},
     ]
 
+    step_num = _parse_step_number(roadmap_step)
+    if step_num is not None:
+        base_custom_fields.append({"id": CI_FIELD_ROADMAP_STEP, "value": step_num})
+
     product = get_product_info(user.name)
     product_lines = ""
     if product:
@@ -1582,6 +1620,7 @@ async def submit_checkin(
                     f"**Date:** {today}\n\n"
                     f"---\n\n"
                     f"**Stage:** {stage}\n\n"
+                    f"**Roadmap Step:** {roadmap_step or '—'}\n\n"
                     f"{product_lines}"
                     f"**Hours Spent This Week:** {weekly_hours}\n\n"
                     f"**Weeks in Stage:** {weeks}\n\n"
@@ -1608,6 +1647,7 @@ async def submit_checkin(
         discord_username=user.name,
         display_name=display_name,
         stage=stage,
+        roadmap_step=roadmap_step,
         weeks=weeks,
         blocker=blocker,
         help_needed=help_needed,
@@ -1619,7 +1659,7 @@ async def submit_checkin(
 
 async def _update_member_after_checkin(discord_username, display_name, stage,
                                        weeks, blocker, help_needed, next_steps,
-                                       checkin_task_id=None):
+                                       roadmap_step="", checkin_task_id=None):
     """Background task to update ClickUp member profile and enrich check-in task."""
     try:
         member_task = await find_member_by_discord(discord_username)
@@ -1628,6 +1668,7 @@ async def _update_member_after_checkin(discord_username, display_name, stage,
                 member_task["id"], stage,
                 weeks=weeks, blocker=blocker,
                 what_would_help=help_needed, next_steps=next_steps,
+                roadmap_step=roadmap_step,
             )
             print(f"[CLICKUP] Member profile updated for {display_name}")
 
@@ -1819,7 +1860,7 @@ class StageSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_stage = self.values[0]
         await interaction.response.send_message(
-            "**Step 2 of 3 — Hours this week**\n"
+            "**Step 2 of 3 — Hours last week**\n"
             "Choose roughly how much time you dedicated last week.",
             view=HoursSelectView(selected_stage=selected_stage),
             ephemeral=True,
@@ -2036,21 +2077,29 @@ async def run_conversational_checkin(
     try:
         await channel.send(
             f"👋 {user.mention} **Weekly coach check-in — let's go.**\n"
-            "I'll ask 7 quick questions. You can type `cancel` any time to bail out."
+            "I'll ask 8 quick questions. You can type `cancel` any time to bail out."
         )
 
         stage = await _ask_select(
             user=user, channel=channel,
-            prompt="**1 / 7 — Which stage are you currently at?**",
+            prompt="**1 / 8 — Which stage are you currently at?**",
             options=STAGE_OPTIONS,
             placeholder="Pick your stage",
         )
         if stage is None:
             return
 
+        roadmap_step = await _ask_text(
+            client=client, user=user, channel=channel,
+            prompt="**2 / 8 — What step number on the roadmap checklist are you at?**\n*Just the number — e.g. `7`*",
+            max_length=10,
+        )
+        if roadmap_step is None:
+            return
+
         weekly_hours = await _ask_select(
             user=user, channel=channel,
-            prompt="**2 / 7 — How much time did you dedicate this week?**",
+            prompt="**3 / 8 — How much time did you dedicate last week?**",
             options=HOURS_OPTIONS,
             placeholder="Pick your hours",
         )
@@ -2059,7 +2108,7 @@ async def run_conversational_checkin(
 
         feeling = await _ask_select(
             user=user, channel=channel,
-            prompt="**3 / 7 — How are you feeling about progress?**",
+            prompt="**4 / 8 — How are you feeling about progress?**",
             options=FEELING_OPTIONS,
             placeholder="Pick the closest match",
         )
@@ -2090,7 +2139,7 @@ async def run_conversational_checkin(
 
         weeks = await _ask_text(
             client=client, user=user, channel=channel,
-            prompt="**4 / 7 — How many weeks have you been in this stage?**\n*e.g. `3`*",
+            prompt="**5 / 8 — How many weeks have you been in this stage?**\n*e.g. `3`*",
             max_length=10,
         )
         if weeks is None:
@@ -2098,7 +2147,7 @@ async def run_conversational_checkin(
 
         blocker = await _ask_text(
             client=client, user=user, channel=channel,
-            prompt="**5 / 7 — What's blocking your progress right now?**\n*Be specific.*",
+            prompt="**6 / 8 — What's blocking your progress right now?**\n*Be specific.*",
             max_length=1000,
         )
         if blocker is None:
@@ -2106,7 +2155,7 @@ async def run_conversational_checkin(
 
         help_needed = await _ask_text(
             client=client, user=user, channel=channel,
-            prompt="**6 / 7 — What kind of support would help you most?**\n*Be specific.*",
+            prompt="**7 / 8 — What kind of support would help you most?**\n*Be specific.*",
             max_length=1000,
         )
         if help_needed is None:
@@ -2114,7 +2163,7 @@ async def run_conversational_checkin(
 
         next_steps = await _ask_text(
             client=client, user=user, channel=channel,
-            prompt="**7 / 7 — The ONE key thing to get done this week?**\n*Be specific.*",
+            prompt="**8 / 8 — The ONE key thing to get done this week?**\n*Be specific.*",
             max_length=1000,
         )
         if next_steps is None:
@@ -2132,6 +2181,7 @@ async def run_conversational_checkin(
         ok, _task_id, err = await submit_checkin(
             user=user,
             stage=stage,
+            roadmap_step=roadmap_step,
             weekly_hours=weekly_hours,
             feeling=feeling,
             weeks=weeks,
@@ -2271,7 +2321,7 @@ async def trigger_checkins(interaction: discord.Interaction):
             "manual_trigger",
             "{mention} 👋 **Weekly coach check-in.**\n"
             "Hit **Start Check-in** below (or type `/checkin`) and I'll walk you "
-            "through 7 quick questions right here. Takes about 2 minutes.\n\n"
+            "through 8 quick questions right here. Takes about 2 minutes.\n\n"
             "*Your coaching team uses this to help you make progress.*",
             "**📋 Weekly Coach Check-in**\n\n"
             "Time for your weekly coach check-in. Click **Start Check-in** below "
@@ -2822,7 +2872,7 @@ async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | 
 _WEEKLY_CHANNEL_MSG = (
     "{mention} 👋 **Weekly coach check-in.**\n"
     "Hit **Start Check-in** below (or type `/checkin`) and I'll walk you "
-    "through 7 quick questions right here. Takes about 2 minutes.\n\n"
+    "through 8 quick questions right here. Takes about 2 minutes.\n\n"
     "*Your coaching team uses this to help you make progress.*"
 )
 _WEEKLY_DM_MSG = (
