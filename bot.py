@@ -1375,8 +1375,8 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
         self.feeling = feeling
 
     roadmap_step = discord.ui.TextInput(
-        label="Where are you on the roadmap checklist?",
-        placeholder="e.g. 3 - Sourcing / Final Verification",
+        label="What step # on the roadmap checklist?",
+        placeholder="Just the number — e.g. 1.7",
         style=discord.TextStyle.short,
         max_length=100,
     )
@@ -1543,14 +1543,18 @@ async def _create_checkin_task(session, headers, task_data):
 
 
 def _parse_step_number(raw: str):
-    """Pull the first integer out of a free-text roadmap-step answer so it can
-    go in the numeric ClickUp field. 'step 7' / '7' / '7-8' → 7; returns None
-    when there's no number, in which case the field is left unset rather than
-    erroring (the raw answer is still kept in the task description)."""
+    """Pull the first number — integer OR decimal — out of a free-text
+    roadmap-step answer so it can go in the numeric ClickUp field. The roadmap
+    uses decimal steps (e.g. '1.7'), so '1.7' → 1.7, 'step 7' → 7, '7-8' → 7.
+    Returns None when there's no number, in which case the field is left unset
+    rather than erroring (the raw answer is still kept in the task description)."""
     if not raw:
         return None
-    m = re.search(r"\d+", str(raw))
-    return int(m.group()) if m else None
+    m = re.search(r"\d+(?:\.\d+)?", str(raw))
+    if not m:
+        return None
+    val = m.group()
+    return float(val) if "." in val else int(val)
 
 
 async def submit_checkin(
@@ -2091,7 +2095,7 @@ async def run_conversational_checkin(
 
         roadmap_step = await _ask_text(
             client=client, user=user, channel=channel,
-            prompt="**2 / 8 — Where are you on the roadmap checklist?**\n*Step number and name — e.g. `3 - Sourcing / Final Verification`*",
+            prompt="**2 / 8 — What step number on the roadmap checklist are you at?**\n*Just the number — e.g. `1.7`*",
             max_length=100,
         )
         if roadmap_step is None:
