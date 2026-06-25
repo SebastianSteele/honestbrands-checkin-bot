@@ -3156,11 +3156,97 @@ async def _handle_api_health(request: web.Request) -> web.Response:
 _api_started = False
 
 
+# --- Discord 1:1 message-count scan (engagement signal) -----------------
+# Counts member-authored messages per 1:1 ticket channel over the last 56 days.
+# Author + timestamp are returned by history() regardless of message-content
+# intent, so this needs no extra permission. Gated by DISCORD_MSG_SCAN so
+# deploying the code is inert until the env flag is set.
+DISCORD_MSG_FILE = os.path.join(STATE_DIR, "discord_msg_counts.json")
+_TICKET_NAME_RE = re.compile(r"^(\d+)-(.+)$")
+_msg_scan_started = False
+
+
+def _resolve_main_guild():
+    gid = (os.getenv("DISCORD_GUILD_ID") or "").strip()
+    if gid:
+        return client.get_guild(int(gid))
+    return client.guilds[0] if len(client.guilds) == 1 else None
+
+
+def _write_json_atomic(path: str, data: dict):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+async def scan_discord_message_counts():
+    """Daily: count member-authored messages per 1:1 ticket channel (last 56d)."""
+    from datetime import datetime, timezone, timedelta
+    await client.wait_until_ready()
+    while True:
+        try:
+            guild = _resolve_main_guild()
+            if guild is None:
+                print("[MSG-SCAN] no guild resolved; retrying in 1h")
+                await asyncio.sleep(3600)
+                continue
+            cutoff = datetime.now(timezone.utc) - timedelta(days=56)
+            counts: dict = {}
+            scanned = 0
+            for ch in guild.text_channels:
+                m = _TICKET_NAME_RE.match(ch.name)
+                if not m:
+                    continue
+                unorm = _normalize_handle(m.group(2))
+                if not unorm:
+                    continue
+                n = 0
+                last_ms = None
+                try:
+                    async for msg in ch.history(after=cutoff, limit=None, oldest_first=False):
+                        if msg.author.bot:
+                            continue
+                        if _normalize_handle(msg.author.name) == unorm:
+                            n += 1
+                            if last_ms is None:
+                                last_ms = int(msg.created_at.timestamp() * 1000)
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    print(f"[MSG-SCAN] skip #{ch.name}: {e}")
+                    continue
+                counts[unorm] = {"messages8w": n, "lastMessageAt": last_ms, "channel": ch.name}
+                scanned += 1
+                await asyncio.sleep(0.5)  # throttle for Discord rate limits
+            _write_json_atomic(DISCORD_MSG_FILE, {
+                "generated_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "channels": scanned,
+                "counts": counts,
+            })
+            print(f"[MSG-SCAN] counted {scanned} ticket channels")
+        except Exception as e:
+            print(f"[MSG-SCAN] error: {e}")
+        await asyncio.sleep(24 * 3600)
+
+
+async def _handle_discord_msg_counts(request: web.Request) -> web.Response:
+    """GET /discord-msg-counts — per-member 1:1 message counts (last 56d)."""
+    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
+    if not CHECKIN_API_SECRET or secret != CHECKIN_API_SECRET:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        with open(DISCORD_MSG_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {"generated_at": None, "channels": 0, "counts": {}}
+    return web.json_response({"ok": True, **data})
+
+
 async def start_api_server() -> None:
     """Run the aiohttp endpoint alongside the Discord client."""
     app = web.Application()
     app.router.add_get("/healthz", _handle_api_health)
     app.router.add_post("/send-checkin", _handle_send_checkin)
+    app.router.add_get("/discord-msg-counts", _handle_discord_msg_counts)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", CHECKIN_API_PORT)
@@ -3183,7 +3269,7 @@ async def _prefetch_weekly_hours_field():
 
 @client.event
 async def on_ready():
-    global _synced, _api_started
+    global _synced, _api_started, _msg_scan_started
 
     # Register persistent views (must happen every reconnect)
     client.add_view(CheckInButton())
@@ -3225,6 +3311,12 @@ async def on_ready():
         if CHECKIN_API_SECRET and not _api_started:
             _api_started = True
             asyncio.create_task(start_api_server())
+
+        # Discord 1:1 message-count engagement scan (gated by DISCORD_MSG_SCAN)
+        if (os.getenv("DISCORD_MSG_SCAN") or "").strip().lower() in ("1", "true", "yes", "on") and not _msg_scan_started:
+            _msg_scan_started = True
+            asyncio.create_task(scan_discord_message_counts())
+            print("[MSG-SCAN] enabled — scanning 1:1 channels on boot + every 24h")
 
         # HonestAI FAQ scraper — daily scrape of #ask-honestai that
         # ships to the Apps Script Web App. Runs here (not in Apps
