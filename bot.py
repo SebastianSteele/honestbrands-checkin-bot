@@ -3165,6 +3165,57 @@ DISCORD_MSG_FILE = os.path.join(STATE_DIR, "discord_msg_counts.json")
 _TICKET_NAME_RE = re.compile(r"^(\d+)-(.+)$")
 _msg_scan_started = False
 
+# --- Unanswered-tag SLA (member spoke last, no staff reply >= 16h) -------
+# Rides the same per-channel history walk as the message-count scan (no extra
+# Discord API calls) and writes a second state file. Surfaced on the HQ
+# dashboard so coaches/CSMs can clear the response backlog.
+SLA_HOURS = int((os.getenv("SLA_HOURS") or "16").strip() or "16")
+SLA_MS = SLA_HOURS * 3600 * 1000
+UNANSWERED_FILE = os.path.join(STATE_DIR, "unanswered_tags.json")
+
+# Authoritative staff (coaches + CSMs + confirmed ticket responders), by Discord
+# user-id. Built from the union of ClickUp-mapped coaches, the "Team - Tickets"/
+# "Coach"/"MSM" roles, and heavy cross-channel responders the roles miss (AlexG,
+# Paul S) — a reply from any of these clears the SLA. Role/username matching was
+# rejected as unreliable (alts, role gaps). Refresh when the team changes, or add
+# ids without a redeploy via STAFF_USER_IDS_EXTRA (comma-separated).
+STAFF_USER_IDS = {
+    1473281451553460373,  # Igor — Success Manager (CSM)
+    1471169508268838996,  # Ana — Success Manager (CSM)
+    273922486465200128,   # Piers L
+    768242784926695424,   # Evan S
+    1101198166503739433,  # abe straker
+    915712013328613436,   # Valentin Esposito
+    1313185736006041620,  # AlexG — responder (not in ClickUp coach field)
+    1178031765684756510,  # Paul S — responder (Group Expert role)
+    1279405013445378161,  # James "Edge" — Head of Success
+    1184413900410720347,  # Marian — Member Support
+    481416250879246337,   # Adell
+    1452457821307142204,  # abe straker (alt account)
+}
+for _x in (os.getenv("STAFF_USER_IDS_EXTRA") or "").replace(" ", "").split(","):
+    if _x.isdigit():
+        STAFF_USER_IDS.add(int(_x))
+
+# Bots + a deleted ex-staff ghost that post in ticket channels — never count as
+# member OR staff messages.
+EXCLUDE_USER_IDS = {
+    1491077309606658138,  # this check-in bot (self)
+    1305602776684036106,  # HonestAI
+    1311706994582749284,  # HFBA "Team HonestBrands" bot
+    456226577798135808,   # Deleted User (ex-staff ghost)
+}
+
+# Closing / acknowledgement phrases — a member message that is just a closer is
+# NOT a waiting tag (validated: ~85% of naive hits were thanks/acks/sign-offs).
+_CLOSER_RE = re.compile(
+    r"^(thanks?|thank you|ty|tysm|cheers|appreciate(d| it)?|no worries|will do|"
+    r"sounds good|got it|perfect|great|awesome|amazing|ok|okay|kk|noted|cancel|"
+    r"all good|nothing( for now)?|have a (great|good)|see you|done|brilliant|"
+    r"fabulous|legend|nice one|sweet|cool|understood|makes sense)\b",
+    re.IGNORECASE,
+)
+
 
 def _resolve_main_guild():
     gid = (os.getenv("DISCORD_GUILD_ID") or "").strip()
@@ -3180,8 +3231,33 @@ def _write_json_atomic(path: str, data: dict):
     os.replace(tmp, path)
 
 
+def _is_closer(msg) -> bool:
+    """True if a member's last message is a conversation-closer (thanks/ack/emoji)
+    rather than something that still needs a staff reply."""
+    if msg is None:
+        return True
+    txt = (msg.content or "").strip()
+    if not txt:
+        return False  # image/attachment-only — could be a real ask, don't suppress
+    low = txt.lower()
+    # Emoji / punctuation only (no letters or digits) → an acknowledgement.
+    if not re.search(r"[a-z0-9]", low):
+        return True
+    # A question is almost always a real ask, never a closer.
+    if "?" in txt:
+        return False
+    # Short message that opens with a closer phrase (avoid nuking long messages
+    # that merely start with "thanks, but I still need ...").
+    words = re.findall(r"[a-z0-9']+", low)
+    if len(words) <= 6 and _CLOSER_RE.match(low):
+        return True
+    return False
+
+
 async def scan_discord_message_counts():
-    """Daily: count member-authored messages per 1:1 ticket channel (last 56d)."""
+    """Daily, per 1:1 ticket channel: count member-authored messages (last 56d)
+    AND detect unanswered tags (member spoke last, no staff reply >= SLA_HOURS).
+    Both ride the SAME history walk — no extra Discord API calls."""
     from datetime import datetime, timezone, timedelta
     await client.wait_until_ready()
     while True:
@@ -3191,8 +3267,10 @@ async def scan_discord_message_counts():
                 print("[MSG-SCAN] no guild resolved; retrying in 1h")
                 await asyncio.sleep(3600)
                 continue
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             cutoff = datetime.now(timezone.utc) - timedelta(days=56)
             counts: dict = {}
+            unanswered: list[dict] = []
             scanned = 0
             for ch in guild.text_channels:
                 m = _TICKET_NAME_RE.match(ch.name)
@@ -3201,28 +3279,81 @@ async def scan_discord_message_counts():
                 unorm = _normalize_handle(m.group(2))
                 if not unorm:
                     continue
+                cat = ch.category.name.lower() if ch.category else ""
+                sla_skip = "closed" in cat  # archived ticket — count, but no SLA
                 n = 0
                 last_ms = None
+                last_member_at = None
+                last_member_obj = None
+                last_staff_at = None
+                last_close_at = None
                 try:
                     async for msg in ch.history(after=cutoff, limit=None, oldest_first=False):
-                        if msg.author.bot:
+                        aid = msg.author.id
+                        if aid in EXCLUDE_USER_IDS:
                             continue
+                        if msg.author.bot:
+                            # Newest-first walk → first close line seen is the newest.
+                            if last_close_at is None and "closed the ticket" in (msg.content or "").lower():
+                                last_close_at = int(msg.created_at.timestamp() * 1000)
+                            continue
+                        ts = int(msg.created_at.timestamp() * 1000)
                         if _normalize_handle(msg.author.name) == unorm:
                             n += 1
                             if last_ms is None:
-                                last_ms = int(msg.created_at.timestamp() * 1000)
+                                last_ms = ts
+                            if last_member_at is None:
+                                last_member_at = ts
+                                last_member_obj = msg
+                        elif aid in STAFF_USER_IDS:
+                            if last_staff_at is None:
+                                last_staff_at = ts
+                        # unknown non-owner human → neither answers nor creates a tag
                 except (discord.Forbidden, discord.HTTPException) as e:
                     print(f"[MSG-SCAN] skip #{ch.name}: {e}")
                     continue
                 counts[unorm] = {"messages8w": n, "lastMessageAt": last_ms, "channel": ch.name}
+                # SLA breach: member newer than any staff reply, past the window, and
+                # not a closer / reacted / closed-ticket / archived channel.
+                if (
+                    not sla_skip
+                    and last_member_at is not None
+                    and (last_staff_at is None or last_member_at > last_staff_at)
+                    and (now_ms - last_member_at) >= SLA_MS
+                    and not (last_close_at is not None and last_close_at >= last_member_at)
+                    and not _is_closer(last_member_obj)
+                    and not (last_member_obj is not None and last_member_obj.reactions)
+                ):
+                    mentioned = []
+                    try:
+                        for u in last_member_obj.mentions:
+                            if (not u.bot) and u.id in STAFF_USER_IDS:
+                                mentioned.append(u.display_name)
+                    except Exception:
+                        pass
+                    unanswered.append({
+                        "member": last_member_obj.author.display_name if last_member_obj else unorm,
+                        "username": unorm,
+                        "channel": ch.name,
+                        "coach": None,
+                        "lastMemberMsgAt": last_member_at,
+                        "waitHours": round((now_ms - last_member_at) / 3_600_000, 1),
+                        "mentionedStaff": mentioned,
+                    })
                 scanned += 1
                 await asyncio.sleep(0.5)  # throttle for Discord rate limits
             _write_json_atomic(DISCORD_MSG_FILE, {
-                "generated_at": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "generated_at": now_ms,
                 "channels": scanned,
                 "counts": counts,
             })
-            print(f"[MSG-SCAN] counted {scanned} ticket channels")
+            unanswered.sort(key=lambda t: t["lastMemberMsgAt"])  # oldest first = longest wait
+            _write_json_atomic(UNANSWERED_FILE, {
+                "generated_at": now_ms,
+                "count": len(unanswered),
+                "tags": unanswered,
+            })
+            print(f"[MSG-SCAN] counted {scanned} channels · {len(unanswered)} unanswered tags (>= {SLA_HOURS}h)")
         except Exception as e:
             print(f"[MSG-SCAN] error: {e}")
         await asyncio.sleep(24 * 3600)
@@ -3241,12 +3372,26 @@ async def _handle_discord_msg_counts(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **data})
 
 
+async def _handle_unanswered_tags(request: web.Request) -> web.Response:
+    """GET /unanswered-tags — members waiting >= SLA_HOURS for a staff reply."""
+    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
+    if not CHECKIN_API_SECRET or secret != CHECKIN_API_SECRET:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        with open(UNANSWERED_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {"generated_at": None, "count": 0, "tags": []}
+    return web.json_response({"ok": True, **data})
+
+
 async def start_api_server() -> None:
     """Run the aiohttp endpoint alongside the Discord client."""
     app = web.Application()
     app.router.add_get("/healthz", _handle_api_health)
     app.router.add_post("/send-checkin", _handle_send_checkin)
     app.router.add_get("/discord-msg-counts", _handle_discord_msg_counts)
+    app.router.add_get("/unanswered-tags", _handle_unanswered_tags)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", CHECKIN_API_PORT)
