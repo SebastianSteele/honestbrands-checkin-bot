@@ -1610,13 +1610,15 @@ async def submit_checkin(
     product = get_product_info(user.name)
     product_lines = ""
     if product:
-        pname = product.get("product_name") or ""
-        plink = product.get("product_link") or ""
-        if pname or plink:
-            product_lines = (
-                f"**Product:** {pname}\n\n"
-                f"**Product Link:** {plink}\n\n"
-            )
+        pname = (product.get("product_name") or "").strip()
+        plink = (product.get("product_link") or "").strip()
+        # Emit each label only when it has a value. A label with a blank value
+        # is not harmless: the sheet-side parser reads the following line as
+        # this field's value (see parseDescription_ in clickup-sheets-sync).
+        if pname:
+            product_lines += f"**Product:** {pname}\n\n"
+        if plink:
+            product_lines += f"**Product Link:** {plink}\n\n"
 
     try:
         async with aiohttp.ClientSession() as session:
