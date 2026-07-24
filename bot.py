@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import json
@@ -11,6 +13,7 @@ from dotenv import load_dotenv
 import aiohttp
 from aiohttp import web
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 load_dotenv()
@@ -72,12 +75,8 @@ CU_PROGRAM_ACCELERATE_INDEX = 1  # orderindex for "Accelerate" in the dropdown
 # ClickUp Member Database — Coach field (users type)
 CU_FIELD_COACH = "3c4c9ce5-07f5-4aa3-a0bf-1dbca6c9efe3"
 
-# Member Database fields written when a member submits product info via the bot.
-# Listings Reviewed is a numeric counter (incremented +1 per submission); Latest
-# Call Topic is a text field overwritten with "Product: <name> — <link>" so
-# coaches see the freshest product info at a glance on the contact page.
-CU_FIELD_LISTINGS_REVIEWED = "22bdd321-6b51-4324-83d0-4878e9ddc3b8"
-CU_FIELD_LATEST_CALL_TOPIC = "fdebf899-a6b3-4216-81f1-f40e26602d54"
+# Canonical public storefront URL on the ClickUp Member Database.
+CU_FIELD_STORE_URL = "4166f954-1644-400c-9b0d-9d6e4a702ae9"
 
 # Program Name dropdown options (orderindex → name)
 PROGRAM_NAMES = {0: "Core", 1: "Accelerate", 2: "Scale", 3: "Velocity"}
@@ -216,7 +215,7 @@ ADVANCED_STAGES = {
 # File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
 KNOWN_MEMBERS_FILE = os.path.join(STATE_DIR, "known_accelerate.json")
 
-# File to cache each member's product name + link so we only ask once
+# File to retain product names. Store URLs always come from ClickUp.
 PRODUCT_INFO_FILE = os.path.join(STATE_DIR, "member_product_info.json")
 
 # DM pacing: send in batches to avoid spam detection
@@ -236,21 +235,23 @@ DM_BATCH_PAUSE = 60  # seconds to pause between batches
 _accelerate_cache: dict = {
     "usernames":        set(),
     "missing_username": [],   # list of {"name": str, "task_id": str, "status": str}
+    "store_urls":       {},   # lowercased Discord username -> canonical ClickUp value
     "last_fetched":     None,
 }
 _CACHE_TTL = timedelta(hours=1)
 
 
-async def fetch_accelerate_usernames() -> set:
+async def fetch_accelerate_usernames(*, force: bool = False) -> set:
     """Query ClickUp Member Database and return a set of lowercased Discord usernames
     whose Program Name is 'Accelerate'.  Results are cached for 1 hour."""
     now = datetime.now()
-    if (_accelerate_cache["last_fetched"] is not None
+    if (not force and _accelerate_cache["last_fetched"] is not None
             and now - _accelerate_cache["last_fetched"] < _CACHE_TTL):
         return _accelerate_cache["usernames"]
 
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
     usernames = set()
+    store_urls: dict[str, str] = {}
     missing_username: list[dict] = []
     page = 0
 
@@ -278,17 +279,26 @@ async def fetch_accelerate_usernames() -> set:
             for task in task_list:
                 program_name_val = None
                 discord_username = None
+                raw_store_url = ""
                 for cf in task.get("custom_fields", []):
                     if cf.get("id") == CU_FIELD_PROGRAM_NAME:
                         program_name_val = cf.get("value")
                     elif cf.get("id") == CU_FIELD_DISCORD_USERNAME:
                         discord_username = (cf.get("value") or "").strip()
+                    elif cf.get("id") == CU_FIELD_STORE_URL:
+                        raw_store_url = (cf.get("value") or "").strip()
                 is_accelerate = (
                     program_name_val is not None
                     and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
                 )
                 if is_accelerate and discord_username:
-                    usernames.add(discord_username.lower())
+                    username_key = discord_username.lower()
+                    usernames.add(username_key)
+                    try:
+                        store_urls[username_key] = normalize_store_url(raw_store_url)
+                    except ValueError as e:
+                        store_urls[username_key] = ""
+                        print(f"[CLICKUP] Invalid Store URL for {discord_username}: {e}")
                 elif is_accelerate and not discord_username:
                     missing_username.append({
                         "name": task.get("name") or "(unnamed)",
@@ -299,6 +309,7 @@ async def fetch_accelerate_usernames() -> set:
 
     _accelerate_cache["usernames"] = usernames
     _accelerate_cache["missing_username"] = missing_username
+    _accelerate_cache["store_urls"] = store_urls
     _accelerate_cache["last_fetched"] = now
     print(f"[CLICKUP] Refreshed Accelerate cache: {len(usernames)} members")
     if missing_username:
@@ -422,8 +433,7 @@ STAGE_OPTIONS = [
     ("6. Scaling Brand", "6. Scaling Brand"),
 ]
 
-# Stages where we ask for product name + link (one-time capture).
-# Anyone past "Finding a Product" should have something to point at.
+# Stages where we retain the optional product name support.
 PRODUCT_INFO_STAGES = {
     "2. Building a Store",
     "3. Creating Ads",
@@ -432,9 +442,56 @@ PRODUCT_INFO_STAGES = {
     "6. Scaling Brand",
 }
 
+# The store URL request belongs only to the store-building and ad-creation work.
+STORE_URL_STAGES = {"2. Building a Store", "3. Creating Ads"}
+
 
 def _stage_requires_product_info(stage: str) -> bool:
     return stage in PRODUCT_INFO_STAGES
+
+
+def _stage_requires_store_url(stage: str) -> bool:
+    return stage in STORE_URL_STAGES
+
+
+def normalize_store_url(raw_url: str) -> str:
+    """Return a customer-facing store origin, or reject admin/supplier URLs."""
+    value = (raw_url or "").strip()
+    if not value:
+        return ""
+    if re.search(r"\s", value):
+        raise ValueError("URLs cannot contain spaces")
+    if "://" not in value:
+        value = f"https://{value}"
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError as e:
+        raise ValueError("Enter a valid public store URL") from e
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only http or https store URLs are accepted")
+    if parsed.username or parsed.password:
+        raise ValueError("Store URLs cannot include login details")
+    if "." not in host:
+        raise ValueError("Enter a public store domain")
+
+    blocked_domain = (
+        host == "admin.shopify.com"
+        or host.endswith(".admin.shopify.com")
+        or host == "aliexpress.com"
+        or host.endswith(".aliexpress.com")
+        or host == "cjdropshipping.com"
+        or host.endswith(".cjdropshipping.com")
+        or host.startswith("amazon.")
+        or ".amazon." in host
+    )
+    first_path_part = next((part for part in parsed.path.lower().split("/") if part), "")
+    if blocked_domain or first_path_part in {"admin", "wp-admin"}:
+        raise ValueError("Use the public storefront, not an admin or supplier URL")
+
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"{parsed.scheme.lower()}://{netloc}/"
 
 
 HOURS_OPTIONS = [
@@ -848,11 +905,9 @@ def mark_fired_today(kind: str, date_iso: str) -> None:
     _save_reminder_fires(data)
 
 
-# --- Member product info persistence ---
-# Once a member tells us their product name + link, we cache it locally and
-# never ask again. Future check-ins include the saved info in the task
-# description so coaches can see what each person is working on without having
-# to re-ask.
+# --- Member product name persistence ---
+# Product names remain locally supported. Store URLs are read only from the
+# refreshable ClickUp member cache below.
 def _load_product_info() -> dict:
     if os.path.exists(PRODUCT_INFO_FILE):
         with open(PRODUCT_INFO_FILE, "r") as f:
@@ -866,18 +921,23 @@ def _save_product_info(data: dict):
 
 
 def get_product_info(discord_username: str) -> dict | None:
-    return _load_product_info().get((discord_username or "").lower())
+    key = (discord_username or "").lower()
+    saved = _load_product_info().get(key) or {}
+    product_name = (saved.get("product_name") or "").strip()
+    store_url = (_accelerate_cache.get("store_urls") or {}).get(key, "")
+    return {"product_name": product_name, "store_url": store_url} if (product_name or store_url) else None
 
 
-def has_product_info(discord_username: str) -> bool:
-    return get_product_info(discord_username) is not None
+def has_product_name(discord_username: str) -> bool:
+    return bool((get_product_info(discord_username) or {}).get("product_name"))
 
 
-def save_member_product_info(discord_username: str, product_name: str, product_link: str):
+def save_member_product_name(discord_username: str, product_name: str):
     data = _load_product_info()
-    data[(discord_username or "").lower()] = {
-        "product_name": (product_name or "").strip(),
-        "product_link": (product_link or "").strip(),
+    key = (discord_username or "").lower()
+    existing = data.get(key) or {}
+    data[key] = {
+        "product_name": (product_name or existing.get("product_name") or "").strip(),
         "captured_at": datetime.now().isoformat(),
     }
     _save_product_info(data)
@@ -1020,64 +1080,41 @@ async def update_member_profile(task_id: str, stage: str,
         print(f"[CLICKUP] Updated member profile: {task_id}")
 
 
-async def save_product_info_to_member_db(discord_username: str,
-                                         product_name: str,
-                                         product_link: str) -> None:
-    """When a member shares their product via the bot, bump 'Listings Reviewed'
-    +1 and overwrite 'Latest Call Topic' with the product info so coaches see
-    it on the contact page."""
+async def save_store_url_to_member_db(discord_username: str, store_url: str) -> bool:
+    """Write the normalized URL to the sole canonical ClickUp Store URL field."""
+    normalized = normalize_store_url(store_url)
+    if not normalized:
+        return False
     try:
         member_task = await find_member_by_discord(discord_username)
     except Exception as e:
-        print(f"[CLICKUP] Product info — member lookup error for {discord_username}: {e}")
-        return
+        print(f"[CLICKUP] Store URL lookup error for {discord_username}: {e}")
+        return False
     if not member_task:
-        print(f"[CLICKUP] Product info — no member match for {discord_username!r}")
-        return
+        print(f"[CLICKUP] Store URL has no member match for {discord_username!r}")
+        return False
 
     task_id = member_task["id"]
-
-    current_count = 0
-    for cf in member_task.get("custom_fields", []):
-        if cf.get("id") == CU_FIELD_LISTINGS_REVIEWED:
-            try:
-                current_count = int(float(cf.get("value") or 0))
-            except (TypeError, ValueError):
-                current_count = 0
-            break
-
-    pname = (product_name or "").strip()
-    plink = (product_link or "").strip()
-    topic = (
-        f"Product: {pname} — {plink}".strip(" —")
-        if (pname or plink)
-        else ""
-    )
-
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
     async with aiohttp.ClientSession() as session:
-        async def _set_field(field_id, value, label):
-            try:
-                async with session.post(
-                    f"https://api.clickup.com/api/v2/task/{task_id}/field/{field_id}",
-                    json={"value": value},
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        print(f"[CLICKUP] Product info — {label} update {r.status}: {body[:300]}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"[CLICKUP] Product info — {label} network error: {e}")
+        try:
+            async with session.post(
+                f"https://api.clickup.com/api/v2/task/{task_id}/field/{CU_FIELD_STORE_URL}",
+                json={"value": normalized},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    body = await response.text()
+                    print(f"[CLICKUP] Store URL update {response.status}: {body[:300]}")
+                    return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[CLICKUP] Store URL network error: {e}")
+            return False
 
-        await _set_field(CU_FIELD_LISTINGS_REVIEWED, current_count + 1, "Listings Reviewed")
-        if topic:
-            await _set_field(CU_FIELD_LATEST_CALL_TOPIC, topic, "Latest Call Topic")
-
-    print(
-        f"[CLICKUP] Product info saved to member {task_id} "
-        f"(Listings Reviewed: {current_count} → {current_count + 1})"
-    )
+    (_accelerate_cache.setdefault("store_urls", {}))[(discord_username or "").lower()] = normalized
+    print(f"[CLICKUP] Store URL saved to member {task_id}: {normalized}")
+    return True
 
 
 # --- Public check-in confirmation in 1-1 ticket channels ---
@@ -1310,10 +1347,10 @@ async def post_checkin_to_ticket_channel(
             # the coach sees what the member wrote.
             product = get_product_info(user.name)
             product_lines = ""
-            if product and (product.get("product_name") or product.get("product_link")):
+            if product and (product.get("product_name") or product.get("store_url")):
                 product_lines = (
                     f"**Product:** {product.get('product_name') or '—'}\n"
-                    f"**Product Link:** {product.get('product_link') or '—'}\n\n"
+                    f"**Store URL:** {product.get('store_url') or '—'}\n\n"
                 )
             body = (
                 f"{user.mention} **Weekly check-in submitted**\n\n"
@@ -1612,14 +1649,14 @@ async def submit_checkin(
     product_lines = ""
     if product:
         pname = (product.get("product_name") or "").strip()
-        plink = (product.get("product_link") or "").strip()
+        store_url = (product.get("store_url") or "").strip()
         # Emit each label only when it has a value. A label with a blank value
         # is not harmless: the sheet-side parser reads the following line as
         # this field's value (see parseDescription_ in clickup-sheets-sync).
         if pname:
             product_lines += f"**Product:** {pname}\n\n"
-        if plink:
-            product_lines += f"**Product Link:** {plink}\n\n"
+        if store_url:
+            product_lines += f"**Store URL:** {store_url}\n\n"
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -1785,50 +1822,56 @@ async def _enrich_checkin_task(checkin_task_id, member_task, discord_username):
             print(f"[CLICKUP] Error enriching check-in task: {e}")
 
 
-# --- Product Info Modal (first-time capture for stage 2+) ---
+# --- Product details modal ---
 class ProductInfoModal(discord.ui.Modal, title="Tell us about your product"):
-    """Asked once per member, only when they pick stage 2+ for the first time.
-    Saves to the local product info cache; future check-ins read from there and
-    skip this modal entirely."""
-
-    def __init__(self, selected_stage: str, weekly_hours: str, feeling: str):
+    def __init__(self, selected_stage: str, weekly_hours: str, feeling: str,
+                 *, ask_product_name: bool, ask_store_url: bool):
         super().__init__()
         self.selected_stage = selected_stage
         self.weekly_hours = weekly_hours
         self.feeling = feeling
-
-    product_name = discord.ui.TextInput(
-        label="What is your product called?",
-        placeholder="e.g., GlowSerum Pro",
-        style=discord.TextStyle.short,
-        max_length=200,
-    )
-    product_link = discord.ui.TextInput(
-        label="Can you share a link?",
-        placeholder="e.g., yourstore.com/product",
-        style=discord.TextStyle.short,
-        max_length=500,
-        required=False,
-    )
+        self.product_name_input = None
+        self.store_url_input = None
+        if ask_product_name:
+            self.product_name_input = discord.ui.TextInput(
+                label="What is your product called?",
+                placeholder="e.g., GlowSerum Pro",
+                style=discord.TextStyle.short,
+                max_length=200,
+            )
+            self.add_item(self.product_name_input)
+        if ask_store_url:
+            self.store_url_input = discord.ui.TextInput(
+                label="Public store URL (optional)",
+                placeholder="e.g., yourstore.com/products/example",
+                style=discord.TextStyle.short,
+                max_length=500,
+                required=False,
+            )
+            self.add_item(self.store_url_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        save_member_product_info(
-            interaction.user.name,
-            self.product_name.value,
-            self.product_link.value,
-        )
-        asyncio.create_task(save_product_info_to_member_db(
-            interaction.user.name,
-            self.product_name.value,
-            self.product_link.value,
-        ))
+        await interaction.response.defer(ephemeral=True)
+        if self.product_name_input:
+            save_member_product_name(interaction.user.name, self.product_name_input.value)
+
+        note = ""
+        if self.store_url_input:
+            try:
+                store_url = normalize_store_url(self.store_url_input.value)
+            except ValueError as e:
+                store_url = ""
+                note = f"\n\n⚠️ Store URL was not saved: {e}."
+            if store_url and not await save_store_url_to_member_db(interaction.user.name, store_url):
+                note = "\n\n⚠️ Store URL could not be saved to ClickUp. You can try again next check-in."
+
         view = ContinueCheckinView(
             selected_stage=self.selected_stage,
             weekly_hours=self.weekly_hours,
             feeling=self.feeling,
         )
-        await interaction.response.send_message(
-            "✅ Got it — product saved.\n\n**Last step — open your check-in:**",
+        await interaction.followup.send(
+            f"✅ Product details saved.{note}\n\n**Last step: open your check-in:**",
             view=view,
             ephemeral=True,
         )
@@ -1937,16 +1980,23 @@ class FeelingSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         feeling = self.values[0]
-        needs_product = (
+        product = get_product_info(interaction.user.name) or {}
+        needs_product_name = (
             _stage_requires_product_info(self.selected_stage)
-            and not has_product_info(interaction.user.name)
+            and not product.get("product_name")
         )
-        if needs_product:
+        needs_store_url = (
+            _stage_requires_store_url(self.selected_stage)
+            and not product.get("store_url")
+        )
+        if needs_product_name or needs_store_url:
             await interaction.response.send_modal(
                 ProductInfoModal(
                     selected_stage=self.selected_stage,
                     weekly_hours=self.weekly_hours,
                     feeling=feeling,
+                    ask_product_name=needs_product_name,
+                    ask_store_url=needs_store_url,
                 ),
             )
         else:
@@ -2131,8 +2181,11 @@ async def run_conversational_checkin(
         if feeling is None:
             return
 
-        # One-time product capture for stages 2+ if we haven't cached it yet.
-        if _stage_requires_product_info(stage) and not has_product_info(user.name):
+        # ClickUp is the authority for the store URL. The cache is refreshable
+        # and the local JSON retains only the optional product name.
+        await fetch_accelerate_usernames()
+        product = get_product_info(user.name) or {}
+        if _stage_requires_product_info(stage) and not product.get("product_name"):
             product_name = await _ask_text(
                 client=client, user=user, channel=channel,
                 prompt="**Quick one-time question — what is your product called?**",
@@ -2140,18 +2193,31 @@ async def run_conversational_checkin(
             )
             if product_name is None:
                 return
-            product_link = await _ask_text(
-                client=client, user=user, channel=channel,
-                prompt="**Can you share a link?**  *(Optional — type `skip` if not yet.)*",
-                max_length=500,
-                required=False,
-            )
-            if product_link is None:
-                return
-            save_member_product_info(user.name, product_name, product_link)
-            asyncio.create_task(save_product_info_to_member_db(
-                user.name, product_name, product_link,
-            ))
+            save_member_product_name(user.name, product_name)
+
+        if _stage_requires_store_url(stage) and not product.get("store_url"):
+            while True:
+                raw_store_url = await _ask_text(
+                    client=client, user=user, channel=channel,
+                    prompt=(
+                        "**Optional: what is your public store URL?**\n"
+                        "*Use the customer-facing store, not Shopify admin or a supplier link.*"
+                    ),
+                    max_length=500,
+                    required=False,
+                )
+                if raw_store_url is None:
+                    return
+                try:
+                    store_url = normalize_store_url(raw_store_url)
+                except ValueError as e:
+                    await channel.send(f"That URL was not saved: {e}. Try again or type `skip`.")
+                    continue
+                break
+            if store_url and not await save_store_url_to_member_db(user.name, store_url):
+                await channel.send(
+                    "I could not save that Store URL to ClickUp. Continue now and try again next check-in."
+                )
 
         weeks = await _ask_text(
             client=client, user=user, channel=channel,
@@ -2272,6 +2338,9 @@ async def _dispatch_checkin_entry(interaction: discord.Interaction) -> None:
     This is the ONLY place that acquires the in-flight lock for a fresh flow.
     Both downstream flows are responsible for releasing it in a `finally`.
     """
+    # Refresh in parallel while the member answers the first three prompts.
+    asyncio.create_task(fetch_accelerate_usernames())
+
     # Already submitted this week?
     if has_checked_in(interaction.user.id):
         await interaction.response.send_message(
@@ -3584,4 +3653,5 @@ async def on_ready():
             print(f"[HAI] FAQ scraper registration failed: {e}")
 
 
-client.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    client.run(DISCORD_TOKEN)
