@@ -12,6 +12,7 @@ known_accelerate.json
 dm_blocked.json
 member_product_info.json
 faq_scraper_state.json
+launch_approval_posts.json
 exports/
 
 # Operational artifacts (handoff CSVs, ad-hoc debug scripts) — never deploy.

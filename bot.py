@@ -160,6 +160,7 @@ def _state_diagnostic() -> None:
         "known_accelerate.json":   os.path.join(STATE_DIR, "known_accelerate.json"),
         "member_product_info.json": os.path.join(STATE_DIR, "member_product_info.json"),
         "faq_scraper_state.json":  os.path.join(STATE_DIR, "faq_scraper_state.json"),
+        "launch_approval_posts.json": os.path.join(STATE_DIR, "launch_approval_posts.json"),
     }
     print(f"[STATE] dir exists: {os.path.isdir(STATE_DIR)}  path: {STATE_DIR}")
     for label, path in targets.items():
@@ -3115,6 +3116,11 @@ async def send_checkin_to_member(member: discord.Member, guild: discord.Guild, k
         return {"ok": False, "error": f"discord_http_{e.status}"}
 
 
+def _api_authorized(request: web.Request) -> bool:
+    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
+    return bool(CHECKIN_API_SECRET) and secret == CHECKIN_API_SECRET
+
+
 async def _handle_send_checkin(request: web.Request) -> web.Response:
     """POST /send-checkin — fire a manual 1:1 check-in nudge.
 
@@ -3122,8 +3128,7 @@ async def _handle_send_checkin(request: web.Request) -> web.Response:
     Body (JSON): { "username"?: str, "user_id"?: str, "kind"?: "weekly"|"midweek" }
     One of username / user_id is required.
     """
-    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
-    if not CHECKIN_API_SECRET or secret != CHECKIN_API_SECRET:
+    if not _api_authorized(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
 
     try:
@@ -3166,6 +3171,14 @@ _api_started = False
 DISCORD_MSG_FILE = os.path.join(STATE_DIR, "discord_msg_counts.json")
 _TICKET_NAME_RE = re.compile(r"^(\d+)-(.+)$")
 _msg_scan_started = False
+
+# Forum where members request approval before launching. The channel id is
+# stable, but remains overrideable so a future channel move is an env change.
+LAUNCH_APPROVAL_CHANNEL_ID = int(
+    (os.getenv("LAUNCH_APPROVAL_CHANNEL_ID") or "1492119603730448525").strip()
+)
+LAUNCH_APPROVAL_FILE = os.path.join(STATE_DIR, "launch_approval_posts.json")
+_launch_scan_started = False
 
 # --- Unanswered-tag SLA (member spoke last, no staff reply >= 16h) -------
 # Rides the same per-channel history walk as the message-count scan (no extra
@@ -3254,6 +3267,79 @@ def _is_closer(msg) -> bool:
     if len(words) <= 6 and _CLOSER_RE.match(low):
         return True
     return False
+
+
+async def scan_launch_approval_posts(guild, generated_at: int) -> None:
+    """Record the first launch-approval forum post made by each member."""
+    channel = guild.get_channel(LAUNCH_APPROVAL_CHANNEL_ID)
+    if not isinstance(channel, discord.ForumChannel):
+        print(f"[LAUNCH-APPROVAL] forum {LAUNCH_APPROVAL_CHANNEL_ID} not found")
+        return
+
+    threads = {thread.id: thread for thread in channel.threads}
+    try:
+        async for thread in channel.archived_threads(limit=None):
+            threads[thread.id] = thread
+    except (discord.Forbidden, discord.HTTPException) as e:
+        # An active-only snapshot would falsely mark every archived poster as
+        # missing in HQ. Keep the last complete snapshot instead.
+        print(f"[LAUNCH-APPROVAL] archived thread scan failed; preserving prior snapshot: {e}")
+        return
+
+    posts_by_owner: dict[int, dict] = {}
+    for thread in threads.values():
+        owner_id = thread.owner_id
+        if not owner_id or owner_id in STAFF_USER_IDS or owner_id in EXCLUDE_USER_IDS:
+            continue
+        member = guild.get_member(owner_id)
+        created_at = thread.created_at or discord.utils.snowflake_time(thread.id)
+        row = {
+            "userId": str(owner_id),
+            "username": member.name if member else None,
+            "displayName": member.display_name if member else None,
+            "postedAt": int(created_at.timestamp() * 1000),
+            "threadUrl": f"https://discord.com/channels/{guild.id}/{thread.id}",
+            "title": thread.name,
+        }
+        prior = posts_by_owner.get(owner_id)
+        if prior is None or row["postedAt"] < prior["postedAt"]:
+            posts_by_owner[owner_id] = row
+
+    posts = sorted(posts_by_owner.values(), key=lambda row: row["postedAt"], reverse=True)
+    _write_json_atomic(LAUNCH_APPROVAL_FILE, {
+        "generated_at": generated_at,
+        "channel_id": str(channel.id),
+        "channel_created_at": int(channel.created_at.timestamp() * 1000),
+        "count": len(posts),
+        "posts": posts,
+    })
+    print(f"[LAUNCH-APPROVAL] {len(posts)} members have posted in #{channel.name}")
+
+
+@client.event
+async def on_thread_create(thread: discord.Thread):
+    """Refresh immediately when a member opens a launch-approval post."""
+    if thread.parent_id != LAUNCH_APPROVAL_CHANNEL_ID:
+        return
+    try:
+        generated_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+        await scan_launch_approval_posts(thread.guild, generated_at)
+    except Exception as e:
+        print(f"[LAUNCH-APPROVAL] thread-create refresh failed: {e}")
+
+
+async def scan_launch_approval_forever():
+    """Reconcile on boot and daily in case a gateway event was missed."""
+    await client.wait_until_ready()
+    while True:
+        try:
+            guild = _resolve_main_guild()
+            if guild is not None:
+                generated_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+                await scan_launch_approval_posts(guild, generated_at)
+        except Exception as e:
+            print(f"[LAUNCH-APPROVAL] scheduled refresh failed: {e}")
+        await asyncio.sleep(24 * 3600)
 
 
 async def scan_discord_message_counts():
@@ -3363,8 +3449,7 @@ async def scan_discord_message_counts():
 
 async def _handle_discord_msg_counts(request: web.Request) -> web.Response:
     """GET /discord-msg-counts — per-member 1:1 message counts (last 56d)."""
-    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
-    if not CHECKIN_API_SECRET or secret != CHECKIN_API_SECRET:
+    if not _api_authorized(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     try:
         with open(DISCORD_MSG_FILE) as f:
@@ -3376,14 +3461,31 @@ async def _handle_discord_msg_counts(request: web.Request) -> web.Response:
 
 async def _handle_unanswered_tags(request: web.Request) -> web.Response:
     """GET /unanswered-tags — members waiting >= SLA_HOURS for a staff reply."""
-    secret = request.headers.get("X-Api-Secret") or request.query.get("secret") or ""
-    if not CHECKIN_API_SECRET or secret != CHECKIN_API_SECRET:
+    if not _api_authorized(request):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
     try:
         with open(UNANSWERED_FILE) as f:
             data = json.load(f)
     except Exception:
         data = {"generated_at": None, "count": 0, "tags": []}
+    return web.json_response({"ok": True, **data})
+
+
+async def _handle_launch_approval_posts(request: web.Request) -> web.Response:
+    """GET /launch-approval-posts — first forum post per member."""
+    if not _api_authorized(request):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        with open(LAUNCH_APPROVAL_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {
+            "generated_at": None,
+            "channel_id": str(LAUNCH_APPROVAL_CHANNEL_ID),
+            "channel_created_at": None,
+            "count": 0,
+            "posts": [],
+        }
     return web.json_response({"ok": True, **data})
 
 
@@ -3394,6 +3496,7 @@ async def start_api_server() -> None:
     app.router.add_post("/send-checkin", _handle_send_checkin)
     app.router.add_get("/discord-msg-counts", _handle_discord_msg_counts)
     app.router.add_get("/unanswered-tags", _handle_unanswered_tags)
+    app.router.add_get("/launch-approval-posts", _handle_launch_approval_posts)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", CHECKIN_API_PORT)
@@ -3416,7 +3519,7 @@ async def _prefetch_weekly_hours_field():
 
 @client.event
 async def on_ready():
-    global _synced, _api_started, _msg_scan_started
+    global _synced, _api_started, _msg_scan_started, _launch_scan_started
 
     # Register persistent views (must happen every reconnect)
     client.add_view(CheckInButton())
@@ -3458,6 +3561,11 @@ async def on_ready():
         if CHECKIN_API_SECRET and not _api_started:
             _api_started = True
             asyncio.create_task(start_api_server())
+
+        if not _launch_scan_started:
+            _launch_scan_started = True
+            asyncio.create_task(scan_launch_approval_forever())
+            print("[LAUNCH-APPROVAL] enabled — scanning on boot, new posts, and every 24h")
 
         # Discord 1:1 message-count engagement scan (gated by DISCORD_MSG_SCAN)
         if (os.getenv("DISCORD_MSG_SCAN") or "").strip().lower() in ("1", "true", "yes", "on") and not _msg_scan_started:
