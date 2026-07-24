@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import aiohttp
 from aiohttp import web
 from datetime import datetime, timedelta, timezone
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -474,6 +475,21 @@ def normalize_store_url(raw_url: str) -> str:
     if parsed.username or parsed.password:
         raise ValueError("Store URLs cannot include login details")
     if "." not in host:
+        raise ValueError("Enter a public store domain")
+    try:
+        ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Enter a public store domain")
+    reserved_suffixes = (
+        ".local", ".localhost", ".internal", ".test", ".example",
+        ".invalid", ".lan", ".home", ".corp",
+    )
+    tld = host.rsplit(".", 1)[-1]
+    if host.endswith(reserved_suffixes) or not re.fullmatch(
+        r"(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})", tld
+    ):
         raise ValueError("Enter a public store domain")
 
     blocked_domain = (

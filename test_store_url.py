@@ -38,7 +38,20 @@ class StoreUrlTests(unittest.TestCase):
                 normalize_store_url(url)
 
     def test_rejects_non_public_or_credential_urls(self):
-        for url in ("localhost/shop", "ftp://store.example.com/file", "https://user:pw@store.example.com"):
+        for url in (
+            "localhost/shop",
+            "http://127.0.0.1/store",
+            "http://10.0.0.1/store",
+            "http://169.254.169.254/store",
+            "http://shop.local/store",
+            "ftp://store.example.com/file",
+            "https://user:pw@store.example.com",
+        ):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                normalize_store_url(url)
+
+    def test_trailing_dot_cannot_bypass_supplier_block(self):
+        for url in ("https://admin.shopify.com./store/example", "https://www.aliexpress.com./item/123"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 normalize_store_url(url)
 
