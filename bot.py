@@ -69,9 +69,8 @@ CU_FIELD_NEXT_STEPS = "414d79b2-d1ab-47b8-981e-428b55f7533a"
 # Last Weekly Check-in Date — date field on the Member Database
 CU_FIELD_LAST_CHECKIN_DATE = "b504e08a-086f-402b-a76f-f5b158896b4c"
 
-# ClickUp Program Name field (dropdown) — used to identify Accelerate members
+# ClickUp Program Name field (dropdown) used to identify check-in members.
 CU_FIELD_PROGRAM_NAME = "d44e9584-d751-40fb-9b52-0cb7fb9d80aa"
-CU_PROGRAM_ACCELERATE_INDEX = 1  # orderindex for "Accelerate" in the dropdown
 
 # ClickUp Member Database — Coach field (users type)
 CU_FIELD_COACH = "3c4c9ce5-07f5-4aa3-a0bf-1dbca6c9efe3"
@@ -80,7 +79,29 @@ CU_FIELD_COACH = "3c4c9ce5-07f5-4aa3-a0bf-1dbca6c9efe3"
 CU_FIELD_STORE_URL = "4166f954-1644-400c-9b0d-9d6e4a702ae9"
 
 # Program Name dropdown options (orderindex → name)
-PROGRAM_NAMES = {0: "Core", 1: "Accelerate", 2: "Scale", 3: "Velocity"}
+PROGRAM_NAMES = {
+    0: "Core",
+    1: "Accelerate",
+    2: "Scale",
+    3: "Velocity",
+    4: "Accelerate Plus",
+}
+CHECKIN_PROGRAM_NAMES = frozenset({"Accelerate", "Accelerate Plus"})
+
+
+def program_name_from_value(value):
+    """Resolve ClickUp's Program Name dropdown orderindex to its label."""
+    if value is None:
+        return None
+    try:
+        return PROGRAM_NAMES.get(int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_checkin_program_value(value) -> bool:
+    """Return True for every program that receives weekly check-ins."""
+    return program_name_from_value(value) in CHECKIN_PROGRAM_NAMES
 
 # ClickUp Check-in List field IDs (populated on each task)
 CI_FIELD_BLOCKER = "84fe7f3d-716c-4cd2-98c6-1a088c32d104"
@@ -110,7 +131,7 @@ STAGE_TO_MILESTONE = {
     "6. Scaling Brand": "5. Scaling",
 }
 
-# Eligibility — only DM Accelerate members who joined Discord on/after this
+# Eligibility for Accelerate and Accelerate Plus members who joined Discord on/after this
 # date AND are within their first CHECKIN_WEEKS_CAP weeks. After 12 weeks the
 # member rolls off the DM list automatically.
 MEMBER_JOIN_CUTOFF = datetime(2026, 3, 1, tzinfo=timezone.utc)
@@ -213,7 +234,7 @@ ADVANCED_STAGES = {
     "5. Scaling",
 }
 
-# File to track which Accelerate members have been seen (so only NEW ones get the onboarding sequence)
+# File to track which check-in members have been seen (so only new ones get the onboarding sequence)
 KNOWN_MEMBERS_FILE = os.path.join(STATE_DIR, "known_accelerate.json")
 
 # File to retain product names. Store URLs always come from ClickUp.
@@ -226,8 +247,8 @@ DM_BATCH_SIZE = 20  # pause after this many DMs
 DM_BATCH_PAUSE = 60  # seconds to pause between batches
 
 
-# --- ClickUp-based Accelerate member lookup (cached) ---
-# `missing_username` holds Accelerate members whose Discord-username field is
+# --- ClickUp-based check-in member lookup (cached) ---
+# `missing_username` holds eligible-program members whose Discord-username field is
 # blank.  Without this, those members are silently dropped from the DM loop
 # (the eligibility filter `member.name.lower() not in accelerate_usernames`
 # fails closed) and we only find out when someone files a "I never got the
@@ -244,7 +265,7 @@ _CACHE_TTL = timedelta(hours=1)
 
 async def fetch_accelerate_usernames(*, force: bool = False) -> set:
     """Query ClickUp Member Database and return a set of lowercased Discord usernames
-    whose Program Name is 'Accelerate'.  Results are cached for 1 hour."""
+    whose Program Name is Accelerate or Accelerate Plus. Results are cached for 1 hour."""
     now = datetime.now()
     if (not force and _accelerate_cache["last_fetched"] is not None
             and now - _accelerate_cache["last_fetched"] < _CACHE_TTL):
@@ -288,10 +309,7 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
                         discord_username = (cf.get("value") or "").strip()
                     elif cf.get("id") == CU_FIELD_STORE_URL:
                         raw_store_url = (cf.get("value") or "").strip()
-                is_accelerate = (
-                    program_name_val is not None
-                    and int(program_name_val) == CU_PROGRAM_ACCELERATE_INDEX
-                )
+                is_accelerate = is_checkin_program_value(program_name_val)
                 if is_accelerate and discord_username:
                     username_key = discord_username.lower()
                     usernames.add(username_key)
@@ -312,12 +330,12 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
     _accelerate_cache["missing_username"] = missing_username
     _accelerate_cache["store_urls"] = store_urls
     _accelerate_cache["last_fetched"] = now
-    print(f"[CLICKUP] Refreshed Accelerate cache: {len(usernames)} members")
+    print(f"[CLICKUP] Refreshed check-in member cache: {len(usernames)} members")
     if missing_username:
         # Loud warning so this shows up in Heroku/Railway logs the moment a
-        # new Accelerate member is created without a Discord handle.
+        # new check-in member is created without a Discord handle.
         print(
-            f"[CLICKUP] WARN: {len(missing_username)} Accelerate member(s) have a "
+            f"[CLICKUP] WARN: {len(missing_username)} Accelerate / Accelerate Plus member(s) have a "
             f"BLANK Discord username and will NOT receive check-in DMs:"
         )
         for entry in missing_username[:20]:
@@ -331,7 +349,7 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
 
 
 def get_accelerate_missing_username() -> list[dict]:
-    """Return the cached list of Accelerate members with a blank Discord username.
+    """Return eligible-program members with a blank Discord username.
 
     Read-only accessor for /checkin_status — the cache is populated as a side
     effect of fetch_accelerate_usernames(), so callers must call that first
@@ -345,7 +363,7 @@ def is_within_join_window(member: discord.Member) -> bool:
     joined Discord on or after MEMBER_JOIN_CUTOFF.
 
     The cohort scope is intentionally tight — coaching check-ins target newer
-    Accelerate members through their first 12 weeks. After that they roll off
+    Accelerate and Accelerate Plus members through their first 12 weeks. After that they roll off
     automatically.
     """
     if member.joined_at is None:
@@ -1755,11 +1773,8 @@ def _extract_member_info(member_task):
     program = None
     coaches = []
     for cf in member_task.get("custom_fields", []):
-        if cf.get("id") == CU_FIELD_PROGRAM_NAME and cf.get("value") is not None:
-            try:
-                program = PROGRAM_NAMES.get(int(cf["value"]))
-            except (ValueError, TypeError):
-                pass
+        if cf.get("id") == CU_FIELD_PROGRAM_NAME:
+            program = program_name_from_value(cf.get("value"))
         elif cf.get("id") == CU_FIELD_COACH and cf.get("value"):
             coaches = [u.get("username", "") for u in cf["value"] if u.get("username")]
     return program, coaches
@@ -2435,8 +2450,8 @@ async def trigger_checkins(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
 
 
-# --- Admin command: show eligibility status for all Accelerate members ---
-@tree.command(name="checkin_status", description="[Admin] Show which Accelerate members are eligible for check-in DMs")
+# --- Admin command: show eligibility status for all check-in members ---
+@tree.command(name="checkin_status", description="[Admin] Show Accelerate and Accelerate Plus check-in eligibility")
 @app_commands.default_permissions(administrator=True)
 async def checkin_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -2474,7 +2489,7 @@ async def checkin_status(interaction: discord.Interaction):
         reason_text = f" — {', '.join(reasons)}" if reasons else ""
         lines.append(f"{status} **{member.display_name}** (joined {joined_str}){reason_text}")
 
-    # Surface Accelerate members in ClickUp who are silently filtered out
+    # Surface check-in members in ClickUp who are silently filtered out
     # because their Discord username field is blank.  These never appear in
     # the eligibility loop above because they're missing from
     # `accelerate_usernames`, so without this section the operator has no
@@ -2491,7 +2506,7 @@ async def checkin_status(interaction: discord.Interaction):
         if len(missing_dc) > 25:
             more = f"\n... and {len(missing_dc) - 25} more"
         missing_block = (
-            f"\n\n**Accelerate members with BLANK Discord username "
+            f"\n\n**Accelerate / Accelerate Plus members with BLANK Discord username "
             f"(silently skipped — fix in ClickUp):** {len(missing_dc)}\n"
             + "\n".join(missing_lines)
             + more
@@ -2499,8 +2514,8 @@ async def checkin_status(interaction: discord.Interaction):
 
     if not lines:
         body = (
-            f"No Accelerate members found in Discord.\n"
-            f"ClickUp has {len(accelerate_usernames)} Accelerate usernames: "
+            f"No Accelerate or Accelerate Plus members found in Discord.\n"
+            f"ClickUp has {len(accelerate_usernames)} eligible program usernames: "
             f"{', '.join(sorted(accelerate_usernames)) or 'none'}"
             f"{missing_block}"
         )
@@ -2510,7 +2525,7 @@ async def checkin_status(interaction: discord.Interaction):
         return
 
     msg = (
-        f"**Accelerate Members — Eligibility Report**\n"
+        f"**Accelerate / Accelerate Plus Eligibility Report**\n"
         f"(Source: ClickUp Program Name | Filter: joined "
         f"≥ {MEMBER_JOIN_CUTOFF.strftime('%b %d, %Y')} "
         f"and within first {CHECKIN_WEEKS_CAP} weeks)\n\n"
@@ -2627,10 +2642,10 @@ async def hai_scrape_now(interaction: discord.Interaction):
     await interaction.followup.send(body, ephemeral=True)
 
 
-# --- Periodic scan: detect new Accelerate members from ClickUp ---
+# --- Periodic scan: detect new check-in members from ClickUp ---
 @tasks.loop(hours=6)
 async def scan_new_accelerate_members():
-    """Check ClickUp for NEW Accelerate members not yet seen by the bot.
+    """Check ClickUp for new Accelerate or Accelerate Plus members not yet seen by the bot.
 
     First run: marks all existing members as 'known' WITHOUT adding them to
     the onboarding pending queue — they get weekly broadcasts instead.
@@ -2640,7 +2655,7 @@ async def scan_new_accelerate_members():
     if not accelerate_usernames:
         return
 
-    # Load known members (already-seen Accelerate members)
+    # Load known members (already-seen check-in members)
     known = {}
     if os.path.exists(KNOWN_MEMBERS_FILE):
         with open(KNOWN_MEMBERS_FILE, "r") as f:
@@ -2690,9 +2705,9 @@ async def scan_new_accelerate_members():
     if first_run:
         # Clear any incorrectly added pending entries from before this fix
         save_pending({})
-        print(f"[SCAN] First run — registered {newly_known} existing Accelerate members (no onboarding DMs)")
+        print(f"[SCAN] First run — registered {newly_known} existing check-in members (no onboarding DMs)")
     else:
-        print(f"[SCAN] Checked {len(accelerate_usernames)} Accelerate members, {newly_known} newly seen, {added} added to onboarding")
+        print(f"[SCAN] Checked {len(accelerate_usernames)} check-in members, {newly_known} newly seen, {added} added to onboarding")
 
 
 @scan_new_accelerate_members.before_loop

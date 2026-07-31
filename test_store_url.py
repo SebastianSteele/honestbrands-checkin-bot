@@ -6,7 +6,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test")
 os.environ.setdefault("CLICKUP_TOKEN", "test")
 os.environ.setdefault("CLICKUP_LIST_ID", "test")
 
-from bot import normalize_store_url
+from bot import is_checkin_program_value, normalize_store_url, program_name_from_value
 
 
 class StoreUrlTests(unittest.TestCase):
@@ -54,6 +54,19 @@ class StoreUrlTests(unittest.TestCase):
         for url in ("https://admin.shopify.com./store/example", "https://www.aliexpress.com./item/123"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 normalize_store_url(url)
+
+
+class ProgramEligibilityTests(unittest.TestCase):
+    def test_accelerate_and_accelerate_plus_receive_checkins(self):
+        self.assertTrue(is_checkin_program_value(1))
+        self.assertTrue(is_checkin_program_value(4))
+        self.assertEqual(program_name_from_value(1), "Accelerate")
+        self.assertEqual(program_name_from_value(4), "Accelerate Plus")
+
+    def test_other_and_invalid_programs_do_not_receive_checkins(self):
+        for value in (None, "", 0, 2, 3, 99, "unknown"):
+            with self.subTest(value=value):
+                self.assertFalse(is_checkin_program_value(value))
 
 
 if __name__ == "__main__":
