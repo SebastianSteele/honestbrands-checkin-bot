@@ -308,5 +308,52 @@ class ReminderEligibilityTests(unittest.IsolatedAsyncioTestCase):
         paused_channel.send.assert_not_awaited()
 
 
+class EnrollmentSequenceTests(unittest.TestCase):
+    def setUp(self):
+        self.enrolled_at = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+    def test_new_sequence_is_anchored_to_clickup_enrollment(self):
+        entry = bot.enrollment_sequence_entry(
+            777,
+            active_record(enrolled_at=self.enrolled_at),
+            now_utc=datetime(2026, 7, 3, tzinfo=timezone.utc),
+        )
+        self.assertEqual(entry["step"], 1)
+        self.assertEqual(
+            entry["next_send_at"],
+            datetime(2026, 7, 8, tzinfo=timezone.utc).isoformat(),
+        )
+
+    def test_late_discovery_skips_missed_steps_instead_of_restarting_week_one(self):
+        entry = bot.enrollment_sequence_entry(
+            777,
+            active_record(enrolled_at=self.enrolled_at),
+            now_utc=datetime(2026, 7, 18, tzinfo=timezone.utc),
+            existing={"guild_id": 777, "step": 1, "added_at": "2026-07-18T00:00:00"},
+        )
+        self.assertEqual(entry["step"], 3)
+        self.assertEqual(
+            entry["next_send_at"],
+            datetime(2026, 7, 22, tzinfo=timezone.utc).isoformat(),
+        )
+
+    def test_sent_sequence_never_moves_backwards(self):
+        entry = bot.enrollment_sequence_entry(
+            777,
+            active_record(enrolled_at=self.enrolled_at),
+            now_utc=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            existing={
+                "guild_id": 777,
+                "step": 4,
+                "last_sent_at": "2026-07-09T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(entry["step"], 4)
+        self.assertEqual(
+            entry["next_send_at"],
+            datetime(2026, 7, 29, tzinfo=timezone.utc).isoformat(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

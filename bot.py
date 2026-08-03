@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 load_dotenv()
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-CHECKIN_ELIGIBILITY_VERSION = "clickup-enrollment-v2"
+CHECKIN_ELIGIBILITY_VERSION = "clickup-enrollment-v3"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
@@ -2820,13 +2820,16 @@ async def scan_new_accelerate_members():
 
             # Truly new member — add to onboarding pending queue
             if user_key not in pending and not has_checked_in(member.id):
-                pending[user_key] = {
-                    "guild_id": guild.id,
-                    "added_at": datetime.now().isoformat(),
-                    "step": 1,
-                }
+                pending_entry = enrollment_sequence_entry(guild.id, member_record)
+                if pending_entry is None:
+                    continue
+                pending[user_key] = pending_entry
                 added += 1
-                print(f"[PENDING] {member.display_name} added via ClickUp scan — first check-in in 7 days")
+                print(
+                    f"[PENDING] {member.display_name} added from ClickUp Enrollment Date "
+                    f"— next sequence step {pending_entry['step']} at "
+                    f"{pending_entry['next_send_at']}"
+                )
 
     with open(KNOWN_MEMBERS_FILE, "w") as f:
         json.dump(known, f, indent=2)
@@ -2925,6 +2928,51 @@ _NEW_MEMBER_MESSAGES = {
 }
 
 
+def enrollment_sequence_entry(
+    guild_id: int,
+    member_record: dict,
+    *,
+    now_utc: datetime | None = None,
+    existing: dict | None = None,
+) -> dict | None:
+    """Build or reconcile a pending sequence from ClickUp Enrollment Date.
+
+    Missed historical steps are skipped instead of being replayed. This keeps
+    the message's week number aligned with the same date used by eligibility.
+    """
+    enrolled_at = member_record.get("enrolled_at")
+    if enrolled_at is None:
+        return None
+    if enrolled_at.tzinfo is None:
+        enrolled_at = enrolled_at.replace(tzinfo=timezone.utc)
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if enrolled_at > now_utc:
+        return None
+
+    elapsed = now_utc - enrolled_at
+    # Step 1 is due seven days after enrollment. Whole-day arithmetic matches
+    # ClickUp's date-only field and avoids time-of-day drift.
+    enrollment_step = max(1, (elapsed.days + 6) // 7)
+    existing = existing or {}
+    existing_step = int(existing.get("step") or 1)
+    if existing.get("last_sent_at"):
+        enrollment_step = max(enrollment_step, existing_step)
+    if enrollment_step > NEW_MEMBER_TOTAL_STEPS:
+        return None
+
+    entry = {
+        "guild_id": guild_id,
+        "enrollment_date": enrolled_at.isoformat(),
+        "step": enrollment_step,
+        "next_send_at": (
+            enrolled_at + timedelta(weeks=enrollment_step)
+        ).isoformat(),
+    }
+    if existing.get("last_sent_at"):
+        entry["last_sent_at"] = existing["last_sent_at"]
+    return entry
+
+
 # --- Background task: send new-member coach check-in sequence (12 DMs, weekly) ---
 @tasks.loop(hours=6)
 async def check_pending_members():
@@ -2937,23 +2985,10 @@ async def check_pending_members():
         fetch_stage_exclusions(force=True),
     )
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     to_remove = []
 
     for user_id, info in list(pending.items()):
-        step = info.get("step", 1)
-        added_at = datetime.fromisoformat(info["added_at"])
-        # Each step fires 7 days after the previous one (step 1 = day 7, step 2 = day 14, ...)
-        last_sent_at = (
-            datetime.fromisoformat(info["last_sent_at"])
-            if info.get("last_sent_at")
-            else added_at
-        )
-        next_send = last_sent_at + timedelta(days=7)
-
-        if now < next_send:
-            continue
-
         guild = client.get_guild(info["guild_id"])
         if not guild:
             to_remove.append(user_id)
@@ -2976,20 +3011,60 @@ async def check_pending_members():
             print(f"[SKIP] {member.display_name} is ineligible ({reason_codes}) — removing from sequence")
             continue
 
+        reconciled = enrollment_sequence_entry(
+            guild.id,
+            member_record,
+            now_utc=now,
+            existing=info,
+        )
+        if reconciled is None:
+            to_remove.append(user_id)
+            continue
+        pending[user_id] = reconciled
+        step = reconciled["step"]
+        next_send = datetime.fromisoformat(reconciled["next_send_at"])
+        if now < next_send:
+            continue
+
         if has_checked_in(member.id):
             continue
 
         message = _NEW_MEMBER_MESSAGES.get(step, _NEW_MEMBER_MESSAGES[4])
         try:
             view = CheckInButton()
-            await member.send(message, view=view)
-            print(f"[DM] New-member step {step} sent to {member.display_name}")
-            await asyncio.sleep(random.uniform(DM_DELAY_MIN, DM_DELAY_MAX))
+            ticket_channel = _pick_ticket_channel_for_confirmation(
+                _ticket_channels_for_member(guild, member)
+            )
+            sent_to_channel = False
+            if ticket_channel is not None:
+                try:
+                    await ticket_channel.send(
+                        f"{member.mention}\n{message}",
+                        view=view,
+                    )
+                    sent_to_channel = True
+                    print(
+                        f"[CHANNEL] Sequence step {step} sent to "
+                        f"#{ticket_channel.name} for {member.display_name}"
+                    )
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    print(
+                        f"[CHANNEL] Sequence route failed in #{ticket_channel.name}: "
+                        f"{e} — falling back to DM"
+                    )
+            if not sent_to_channel:
+                await member.send(message, view=view)
+                print(f"[DM] Sequence step {step} sent to {member.display_name}")
+                await asyncio.sleep(random.uniform(DM_DELAY_MIN, DM_DELAY_MAX))
 
             if step >= NEW_MEMBER_TOTAL_STEPS:
                 to_remove.append(user_id)
             else:
                 pending[user_id]["step"] = step + 1
+                pending[user_id]["next_send_at"] = (
+                    member_record["enrolled_at"] + timedelta(weeks=step + 1)
+                ).isoformat()
                 pending[user_id]["last_sent_at"] = now.isoformat()
 
         except discord.Forbidden:
