@@ -267,6 +267,10 @@ DM_BATCH_PAUSE = 60  # seconds to pause between batches
 # and through /checkin_status makes the failure mode loud.
 _accelerate_cache: dict = {
     "usernames":        set(),
+    "records":          [],    # every Accelerate / Accelerate Plus ClickUp record
+    "records_by_username": {}, # normalized Discord username -> records
+    "records_by_user_id": {},  # live Discord member id -> records (rebuilt per guild)
+    "bindings_guild_id": None,
     "missing_username": [],   # list of {"name": str, "task_id": str, "status": str}
     "excluded_status":  [],   # eligible-program records intentionally not contacted
     "store_urls":       {},   # lowercased Discord username -> canonical ClickUp value
@@ -285,6 +289,8 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
 
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
     usernames = set()
+    records: list[dict] = []
+    records_by_username: dict[str, list[dict]] = {}
     store_urls: dict[str, str] = {}
     missing_username: list[dict] = []
     excluded_status: list[dict] = []
@@ -324,6 +330,20 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
                     elif cf.get("id") == CU_FIELD_STORE_URL:
                         raw_store_url = (cf.get("value") or "").strip()
                 is_accelerate = is_checkin_program_value(program_name_val)
+                if is_accelerate:
+                    username_key = (discord_username or "").lower()
+                    record = {
+                        "name": task.get("name") or "(unnamed)",
+                        "task_id": task.get("id") or "",
+                        "status": status_name,
+                        "program": program_name_from_value(program_name_val),
+                        "discord_username": discord_username or "",
+                        "discord_username_key": username_key,
+                        "store_url": raw_store_url,
+                    }
+                    records.append(record)
+                    if username_key:
+                        records_by_username.setdefault(username_key, []).append(record)
                 if is_accelerate and not is_checkin_member_status(status_name):
                     excluded_status.append({
                         "name": task.get("name") or "(unnamed)",
@@ -348,6 +368,11 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
             page += 1
 
     _accelerate_cache["usernames"] = usernames
+    _accelerate_cache["records"] = records
+    _accelerate_cache["records_by_username"] = records_by_username
+    # Guild-specific ID bindings must be rebuilt after every ClickUp refresh.
+    _accelerate_cache["records_by_user_id"] = {}
+    _accelerate_cache["bindings_guild_id"] = None
     _accelerate_cache["missing_username"] = missing_username
     _accelerate_cache["excluded_status"] = excluded_status
     _accelerate_cache["store_urls"] = store_urls
@@ -394,7 +419,7 @@ def get_checkin_status_exclusions() -> list[dict]:
     return list(_accelerate_cache.get("excluded_status") or [])
 
 
-def is_within_join_window(member: discord.Member) -> bool:
+def is_within_join_window(member: discord.Member, *, now_utc: datetime | None = None) -> bool:
     """Return True if the member is in their first CHECKIN_WEEKS_CAP weeks AND
     joined Discord on or after MEMBER_JOIN_CUTOFF.
 
@@ -406,24 +431,86 @@ def is_within_join_window(member: discord.Member) -> bool:
         return False
     if member.joined_at < MEMBER_JOIN_CUTOFF:
         return False
-    weeks_since_join = (datetime.now(timezone.utc) - member.joined_at).days / 7
+    now_utc = now_utc or datetime.now(timezone.utc)
+    weeks_since_join = (now_utc - member.joined_at).days / 7
     return weeks_since_join < CHECKIN_WEEKS_CAP
 
 
-# --- ClickUp-based Stage 4/5 exclusion (checks submitted check-ins) ---
-_exclusion_cache: dict = {"user_ids": set(), "last_fetched": None}
+# --- ClickUp-based advanced-stage exclusion (submitted check-ins) ---
+# Both indexes are required during the migration to stable Discord IDs:
+# historical tasks only contain the username, while every new task contains a
+# `uid:<discord id>` tag. For each identity we retain the newest check-in only.
+_exclusion_cache: dict = {
+    "by_user_id": {},
+    "by_username": {},
+    "last_fetched": None,
+}
 
 
-async def fetch_excluded_user_ids() -> set:
-    """Query the ClickUp check-in list and return a set of Discord user IDs
-    whose most recent check-in has Stage 4 or 5.  Cached for 1 hour."""
+def _checkin_username_from_task(task: dict) -> str:
+    description = task.get("description") or ""
+    match = re.search(
+        r"\*\*Discord Username:\*\*\s*([^\s\n]+)",
+        description,
+        re.IGNORECASE,
+    )
+    return (match.group(1) if match else "").strip().lstrip("@").lower()
+
+
+def _build_stage_exclusion_index(tasks_in: list[dict]) -> dict:
+    """Return the latest recorded stage by stable ID and legacy username."""
+    latest_by_user_id: dict[str, tuple[int, str]] = {}
+    latest_by_username: dict[str, tuple[int, str]] = {}
+
+    for task in tasks_in:
+        stage = ""
+        for cf in task.get("custom_fields", []):
+            if cf.get("id") == CI_FIELD_STAGE:
+                stage = (cf.get("value") or "").strip()
+                break
+        if not stage:
+            continue
+
+        try:
+            created_at = int(task.get("date_created") or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+
+        user_id = ""
+        for tag in task.get("tags", []):
+            tag_name = (tag.get("name") or "").strip().lower()
+            if tag_name.startswith("uid:") and tag_name[4:].isdigit():
+                user_id = tag_name[4:]
+                break
+        username = _checkin_username_from_task(task)
+
+        if user_id:
+            previous = latest_by_user_id.get(user_id)
+            if previous is None or created_at > previous[0]:
+                latest_by_user_id[user_id] = (created_at, stage)
+        if username:
+            previous = latest_by_username.get(username)
+            if previous is None or created_at > previous[0]:
+                latest_by_username[username] = (created_at, stage)
+
+    return {
+        "by_user_id": {key: value[1] for key, value in latest_by_user_id.items()},
+        "by_username": {key: value[1] for key, value in latest_by_username.items()},
+    }
+
+
+async def fetch_stage_exclusions(*, force: bool = False) -> dict:
+    """Return each member's latest submitted stage, cached for one hour."""
     now = datetime.now()
-    if (_exclusion_cache["last_fetched"] is not None
+    if (not force and _exclusion_cache["last_fetched"] is not None
             and now - _exclusion_cache["last_fetched"] < _CACHE_TTL):
-        return _exclusion_cache["user_ids"]
+        return {
+            "by_user_id": dict(_exclusion_cache["by_user_id"]),
+            "by_username": dict(_exclusion_cache["by_username"]),
+        }
 
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
-    excluded = set()
+    all_tasks: list[dict] = []
     page = 0
 
     async with aiohttp.ClientSession() as session:
@@ -437,38 +524,49 @@ async def fetch_excluded_user_ids() -> set:
                 ) as resp:
                     if resp.status != 200:
                         print(f"[CLICKUP] Failed to fetch check-ins: {resp.status}")
-                        return _exclusion_cache["user_ids"]
+                        return {
+                            "by_user_id": dict(_exclusion_cache["by_user_id"]),
+                            "by_username": dict(_exclusion_cache["by_username"]),
+                        }
                     data = await resp.json()
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 print(f"[CLICKUP] Network error fetching check-ins: {e}")
-                return _exclusion_cache["user_ids"]
+                return {
+                    "by_user_id": dict(_exclusion_cache["by_user_id"]),
+                    "by_username": dict(_exclusion_cache["by_username"]),
+                }
 
             task_list = data.get("tasks", [])
             if not task_list:
                 break
 
-            for task in task_list:
-                stage = None
-                for cf in task.get("custom_fields", []):
-                    if cf.get("id") == CI_FIELD_STAGE:
-                        stage = (cf.get("value") or "").strip()
-                if stage and stage in ADVANCED_STAGES:
-                    # Extract Discord user ID from uid: tag
-                    for tag in task.get("tags", []):
-                        tag_name = tag.get("name", "")
-                        if tag_name.startswith("uid:"):
-                            excluded.add(tag_name[4:])
+            all_tasks.extend(task_list)
             page += 1
 
-    _exclusion_cache["user_ids"] = excluded
+    index = _build_stage_exclusion_index(all_tasks)
+    _exclusion_cache["by_user_id"] = index["by_user_id"]
+    _exclusion_cache["by_username"] = index["by_username"]
     _exclusion_cache["last_fetched"] = now
-    print(f"[CLICKUP] Refreshed exclusion cache: {len(excluded)} members in Stage 4/5")
-    return excluded
+    advanced_ids = sum(stage in ADVANCED_STAGES for stage in index["by_user_id"].values())
+    advanced_names = sum(stage in ADVANCED_STAGES for stage in index["by_username"].values())
+    print(
+        f"[CLICKUP] Refreshed stage cache: {advanced_ids} stable IDs and "
+        f"{advanced_names} legacy usernames currently advanced"
+    )
+    return index
 
 
-def is_advanced_stage(user_id, excluded_ids: set) -> bool:
-    """Return True if the user's ID appears in the ClickUp-based exclusion set."""
-    return str(user_id) in excluded_ids
+def is_advanced_stage(member, stage_index: dict, member_record: dict | None = None) -> bool:
+    """Use stable Discord ID first, with current username for legacy tasks."""
+    user_id = str(getattr(member, "id", ""))
+    usernames = {(getattr(member, "name", "") or "").lower()}
+    if member_record:
+        usernames.add(member_record.get("discord_username_key") or "")
+    by_user_id = stage_index.get("by_user_id") or {}
+    by_username = stage_index.get("by_username") or {}
+    if user_id in by_user_id:
+        return by_user_id[user_id] in ADVANCED_STAGES
+    return any(by_username.get(username) in ADVANCED_STAGES for username in usernames if username)
 
 # --- Discord setup ---
 intents = discord.Intents.default()
@@ -1201,6 +1299,7 @@ def _normalize_handle(s: str) -> str:
 
 
 def _ticket_channels_for_username(guild: discord.Guild, username_lower: str) -> list[discord.TextChannel]:
+    """Legacy migration fallback for tickets that have no explicit member overwrite."""
     target_exact = (username_lower or "").lower()
     target_norm = _normalize_handle(username_lower)
     found = []
@@ -1212,6 +1311,217 @@ def _ticket_channels_for_username(guild: discord.Guild, username_lower: str) -> 
         if seg.lower() == target_exact or (target_norm and _normalize_handle(seg) == target_norm):
             found.append(ch)
     return found
+
+
+def _explicit_ticket_member_ids(channel: discord.TextChannel) -> set[int]:
+    """Return non-bot members explicitly granted view access to this ticket."""
+    member_ids: set[int] = set()
+    for target, overwrite in (getattr(channel, "overwrites", {}) or {}).items():
+        # Discord roles have no `bot` attribute; members do. Avoid inherited
+        # role access because it is not a stable signal for the ticket owner.
+        if not hasattr(target, "bot") or getattr(target, "bot", False):
+            continue
+        if getattr(overwrite, "view_channel", None) is True:
+            member_ids.add(target.id)
+    return member_ids
+
+
+def _ticket_channels_for_member(
+    guild: discord.Guild,
+    member: discord.Member,
+) -> list[discord.TextChannel]:
+    """Find a 1:1 ticket by stable member ID, then fall back to its old slug."""
+    member_id = getattr(member, "id", None)
+    explicit = []
+    for channel in guild.text_channels:
+        if not _TICKET_CHANNEL_NAME_RE.match(channel.name.strip()):
+            continue
+        if member_id in _explicit_ticket_member_ids(channel):
+            explicit.append(channel)
+    if explicit:
+        return explicit
+    return _ticket_channels_for_username(guild, getattr(member, "name", ""))
+
+
+def _bind_checkin_records_to_guild(guild: discord.Guild) -> dict[str, list[dict]]:
+    """Bind ClickUp records to stable Discord IDs using live identity signals.
+
+    Exact current usernames are accepted for the initial association. When a
+    username has changed, the explicit member permission on the legacy-named
+    1:1 channel supplies the stable ID. All later routing uses that ID.
+    """
+    if _accelerate_cache.get("bindings_guild_id") == guild.id:
+        return _accelerate_cache.get("records_by_user_id") or {}
+
+    records = list(_accelerate_cache.get("records") or [])
+    by_id: dict[str, list[dict]] = {}
+    members_by_username = {
+        (member.name or "").lower(): member
+        for member in guild.members
+        if not member.bot
+    }
+
+    for record in records:
+        username = record.get("discord_username_key") or ""
+        member = members_by_username.get(username)
+        if member is not None:
+            by_id.setdefault(str(member.id), []).append(record)
+
+    for record in records:
+        username = record.get("discord_username_key") or ""
+        if not username:
+            continue
+        owner_ids: set[int] = set()
+        for channel in _ticket_channels_for_username(guild, username):
+            owner_ids.update(_explicit_ticket_member_ids(channel))
+        # Only trust an unambiguous explicit ticket owner.
+        if len(owner_ids) == 1:
+            owner_id = str(next(iter(owner_ids)))
+            if record not in by_id.setdefault(owner_id, []):
+                by_id[owner_id].append(record)
+
+    _accelerate_cache["records_by_user_id"] = by_id
+    _accelerate_cache["bindings_guild_id"] = guild.id
+    return by_id
+
+
+def _best_checkin_member_record(records: list[dict]) -> dict | None:
+    if not records:
+        return None
+    # If a duplicate record exists, the active one is the only valid contact
+    # source. Keep the choice deterministic for reporting and tests.
+    return sorted(
+        records,
+        key=lambda record: (
+            not is_checkin_member_status(record.get("status")),
+            record.get("task_id") or "",
+        ),
+    )[0]
+
+
+def checkin_member_record_for(guild: discord.Guild, member: discord.Member) -> dict | None:
+    by_id = _bind_checkin_records_to_guild(guild)
+    return _best_checkin_member_record(by_id.get(str(member.id), []))
+
+
+def evaluate_checkin_eligibility(
+    member,
+    member_record: dict | None,
+    stage_index: dict,
+    *,
+    already_checked_in: bool = False,
+    now_utc: datetime | None = None,
+) -> dict:
+    """Canonical eligibility decision for every check-in entry and sender."""
+    reasons: list[dict] = []
+
+    if member_record is None:
+        reasons.append({
+            "code": "not_member",
+            "message": "No Accelerate or Accelerate Plus ClickUp member record is linked to your Discord account.",
+        })
+    else:
+        program = member_record.get("program")
+        status = member_record.get("status") or ""
+        if program not in CHECKIN_PROGRAM_NAMES:
+            reasons.append({"code": "wrong_program", "message": "Your current program is not eligible for this check-in."})
+        if not is_checkin_member_status(status):
+            reasons.append({
+                "code": "inactive_status",
+                "message": f"Your ClickUp member status is {status or 'not active'}.",
+            })
+
+    joined_at = getattr(member, "joined_at", None)
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if joined_at is None:
+        reasons.append({"code": "missing_join_date", "message": "Your Discord join date could not be verified."})
+    elif joined_at < MEMBER_JOIN_CUTOFF:
+        reasons.append({"code": "before_cutoff", "message": "Your Discord join date is before the current check-in cohort."})
+    elif not is_within_join_window(member, now_utc=now_utc):
+        reasons.append({"code": "outside_window", "message": f"Your {CHECKIN_WEEKS_CAP}-week check-in window has ended."})
+
+    if is_advanced_stage(member, stage_index, member_record):
+        reasons.append({"code": "advanced_stage", "message": "You have reached an advanced stage and no longer need weekly check-in reminders."})
+    if already_checked_in:
+        reasons.append({"code": "already_checked_in", "message": "You have already checked in this week."})
+
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "record": member_record,
+        "member": member,
+    }
+
+
+def _guild_member_for_user(user, guild: discord.Guild | None = None):
+    user_id = getattr(user, "id", None)
+    if guild is not None and user_id is not None:
+        member = guild.get_member(user_id)
+        if member is not None:
+            return guild, member
+    for candidate in client.guilds:
+        member = candidate.get_member(user_id) if user_id is not None else None
+        if member is not None:
+            return candidate, member
+    return guild, user if guild is not None and hasattr(user, "joined_at") else None
+
+
+_eligibility_refresh_lock = asyncio.Lock()
+
+
+def _eligibility_sources_are_recent(max_age_seconds: int = 30) -> bool:
+    now = datetime.now()
+    fetched_at = (
+        _accelerate_cache.get("last_fetched"),
+        _exclusion_cache.get("last_fetched"),
+    )
+    return all(
+        timestamp is not None and (now - timestamp).total_seconds() < max_age_seconds
+        for timestamp in fetched_at
+    )
+
+
+async def resolve_checkin_eligibility(
+    user,
+    guild: discord.Guild | None = None,
+    *,
+    force: bool = False,
+) -> dict:
+    """Refresh canonical sources and evaluate one Discord user."""
+    # Coalesce a burst of button clicks after a reminder. The first interaction
+    # performs the live refresh; the rest reuse that result for 30 seconds.
+    async with _eligibility_refresh_lock:
+        effective_force = force and not _eligibility_sources_are_recent()
+        _, stage_index = await asyncio.gather(
+            fetch_accelerate_usernames(force=effective_force),
+            fetch_stage_exclusions(force=effective_force),
+        )
+    resolved_guild, member = _guild_member_for_user(user, guild)
+    if resolved_guild is None or member is None:
+        return {
+            "eligible": False,
+            "reasons": [{"code": "not_in_guild", "message": "Your Discord membership could not be verified."}],
+            "record": None,
+            "member": member,
+        }
+    record = checkin_member_record_for(resolved_guild, member)
+    return evaluate_checkin_eligibility(
+        member,
+        record,
+        stage_index,
+        already_checked_in=has_checked_in(member.id),
+    )
+
+
+def checkin_ineligibility_message(result: dict) -> str:
+    reasons = result.get("reasons") or []
+    if len(reasons) == 1 and reasons[0].get("code") == "already_checked_in":
+        return "You've already checked in this week. See you next Monday. 👊"
+    details = "\n".join(f"• {reason['message']}" for reason in reasons)
+    return (
+        "This check-in is only available to currently eligible Accelerate and "
+        f"Accelerate Plus members.\n\n{details}"
+    )
 
 
 def _pick_ticket_channel_for_confirmation(channels: list[discord.TextChannel]) -> discord.TextChannel | None:
@@ -1385,7 +1695,8 @@ async def post_checkin_to_ticket_channel(
             print("[TICKET] Guild not found for ticket confirmation.")
             return
 
-        candidates = _ticket_channels_for_username(guild, user.name.lower())
+        member = guild.get_member(user.id) or user
+        candidates = _ticket_channels_for_member(guild, member)
         channel = _pick_ticket_channel_for_confirmation(candidates)
         if channel is None:
             print(f"[TICKET] No ticket channel matching username {user.name!r}")
@@ -1515,11 +1826,17 @@ class CheckInModal(discord.ui.Modal, title="Weekly Coach Check-in"):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
-            # Idempotency: if another open form already recorded a check-in,
-            # bail before creating a duplicate ClickUp task.
-            if has_checked_in(interaction.user.id):
+            # Re-check the canonical sources at submission time. A member may
+            # have been paused while an old form was still open, and no entry
+            # surface is allowed to bypass the same eligibility decision.
+            eligibility = await resolve_checkin_eligibility(
+                interaction.user,
+                getattr(interaction, "guild", None),
+                force=True,
+            )
+            if not eligibility["eligible"]:
                 await interaction.followup.send(
-                    "Looks like you already checked in this week — no duplicate created.",
+                    checkin_ineligibility_message(eligibility),
                     ephemeral=True,
                 )
                 return
@@ -1658,6 +1975,11 @@ def _parse_step_number(raw: str):
     return float(val) if "." in val else int(val)
 
 
+def checkin_task_tags(user) -> list[str]:
+    """Human-searchable username plus canonical stable Discord identity."""
+    return ["check-in", user.name, f"uid:{user.id}"]
+
+
 async def submit_checkin(
     *,
     user,
@@ -1737,7 +2059,9 @@ async def submit_checkin(
                     f"**ONE Key Thing This Week:** {next_steps}"
                 ),
                 "priority": 3,
-                "tags": ["check-in", user.name],
+                # Stable Discord ID is the canonical identity for advanced-stage
+                # exclusion. Keep the username tag for human search only.
+                "tags": checkin_task_tags(user),
                 "custom_fields": custom_fields,
             }
             checkin_task_id, err = await _create_checkin_task(session, headers, task_data)
@@ -2088,27 +2412,31 @@ async def _dispatch_checkin_entry(interaction: discord.Interaction) -> None:
     selects and modal. The completed summary is posted once in the member's
     1-1 channel by CheckInModal.on_submit.
     """
-    # Refresh in parallel while the member answers the first three prompts.
-    asyncio.create_task(fetch_accelerate_usernames())
-
-    # Already submitted this week?
-    if has_checked_in(interaction.user.id):
-        await interaction.response.send_message(
-            "You've already checked in this week — see you next Monday. 👊",
+    # ClickUp pagination can take longer than Discord's three-second response
+    # window, so acknowledge first and validate before opening any form.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    eligibility = await resolve_checkin_eligibility(
+        interaction.user,
+        getattr(interaction, "guild", None),
+        force=True,
+    )
+    if not eligibility["eligible"]:
+        await interaction.followup.send(
+            checkin_ineligibility_message(eligibility),
             ephemeral=True,
         )
         return
 
     # Single lock acquire closes the double-click race for every entry surface.
     if not acquire_checkin_lock(interaction.user.id):
-        await interaction.response.send_message(
-            "You've already got a check-in open — finish that one first.",
+        await interaction.followup.send(
+            "You've already got a check-in open. Finish that one first.",
             ephemeral=True,
         )
         return
 
     try:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "**Step 1 of 3 — Stage**\n"
             "Pick the stage you're at. Next you'll pick **hours** and **how you're feeling**, "
             "then the private form opens.",
@@ -2150,37 +2478,28 @@ async def trigger_checkins(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def checkin_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    accelerate_usernames = await fetch_accelerate_usernames()
-    excluded_ids = await fetch_excluded_user_ids()
-    weeks_cutoff = datetime.now(timezone.utc) - timedelta(weeks=CHECKIN_WEEKS_CAP)
+    accelerate_usernames, stage_index = await asyncio.gather(
+        fetch_accelerate_usernames(force=True),
+        fetch_stage_exclusions(force=True),
+    )
+    _bind_checkin_records_to_guild(interaction.guild)
     lines = []
     for member in interaction.guild.members:
         if member.bot:
             continue
-        if member.name.lower() not in accelerate_usernames:
+        member_record = checkin_member_record_for(interaction.guild, member)
+        if member_record is None:
             continue
         joined = member.joined_at
         joined_str = joined.strftime("%b %d, %Y") if joined else "unknown"
-        reasons = []
-        eligible = True
-        if joined and joined < MEMBER_JOIN_CUTOFF:
-            reasons.append(
-                f"joined {joined_str} (before {MEMBER_JOIN_CUTOFF.strftime('%b %d, %Y')} cutoff)"
-            )
-            eligible = False
-        if joined and joined < weeks_cutoff:
-            reasons.append(f"joined {joined_str} (>{CHECKIN_WEEKS_CAP} weeks ago)")
-            eligible = False
-        if has_checked_in(member.id):
-            reasons.append("already checked in this week")
-            eligible = False
-        if is_advanced_stage(member.id, excluded_ids):
-            reasons.append("Making Sales / Scaling Brand")
-            eligible = False
-        if is_dm_blocked(member.id):
-            reasons.append("DMs blocked")
-            eligible = False
-        status = "✅" if eligible else "❌"
+        result = evaluate_checkin_eligibility(
+            member,
+            member_record,
+            stage_index,
+            already_checked_in=has_checked_in(member.id),
+        )
+        reasons = [reason["message"] for reason in result["reasons"]]
+        status = "✅" if result["eligible"] else "❌"
         reason_text = f" — {', '.join(reasons)}" if reasons else ""
         lines.append(f"{status} **{member.display_name}** (joined {joined_str}){reason_text}")
 
@@ -2360,7 +2679,10 @@ async def scan_new_accelerate_members():
     the onboarding pending queue — they get weekly broadcasts instead.
     Subsequent runs: only truly new members are added to pending.
     """
-    accelerate_usernames = await fetch_accelerate_usernames()
+    accelerate_usernames, stage_index = await asyncio.gather(
+        fetch_accelerate_usernames(force=True),
+        fetch_stage_exclusions(force=True),
+    )
     if not accelerate_usernames:
         return
 
@@ -2376,12 +2698,18 @@ async def scan_new_accelerate_members():
     newly_known = 0
 
     for guild in client.guilds:
+        _bind_checkin_records_to_guild(guild)
         for member in guild.members:
             if member.bot:
                 continue
-            if member.name.lower() not in accelerate_usernames:
-                continue
-            if not is_within_join_window(member):
+            member_record = checkin_member_record_for(guild, member)
+            result = evaluate_checkin_eligibility(
+                member,
+                member_record,
+                stage_index,
+                already_checked_in=False,
+            )
+            if not result["eligible"]:
                 continue
             user_key = str(member.id)
             if user_key in known:
@@ -2509,7 +2837,10 @@ async def check_pending_members():
     if not pending:
         return
 
-    excluded_ids = await fetch_excluded_user_ids()
+    _, stage_index = await asyncio.gather(
+        fetch_accelerate_usernames(force=True),
+        fetch_stage_exclusions(force=True),
+    )
 
     now = datetime.now()
     to_remove = []
@@ -2537,9 +2868,20 @@ async def check_pending_members():
             to_remove.append(user_id)
             continue
 
-        if is_advanced_stage(int(user_id), excluded_ids):
+        member_record = checkin_member_record_for(guild, member)
+        result = evaluate_checkin_eligibility(
+            member,
+            member_record,
+            stage_index,
+            already_checked_in=False,
+        )
+        if not result["eligible"]:
             to_remove.append(user_id)
-            print(f"[SKIP] {member.display_name} is in advanced stage — removing from sequence")
+            reason_codes = ",".join(reason["code"] for reason in result["reasons"])
+            print(f"[SKIP] {member.display_name} is ineligible ({reason_codes}) — removing from sequence")
+            continue
+
+        if has_checked_in(member.id):
             continue
 
         message = _NEW_MEMBER_MESSAGES.get(step, _NEW_MEMBER_MESSAGES[4])
@@ -2591,8 +2933,8 @@ async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | 
 
     Routing: post in the member's 1-1 ticket channel (with @mention + the
     Start Check-in button) when one exists; otherwise fall back to DM. The
-    ticket channel is the same one the bot already posts confirmations into —
-    `<ticket#>-<discord_username>`, e.g. `69-michaelralston92`.
+    ticket channel is resolved from the member's explicit Discord permission;
+    the historical `<ticket#>-<discord_username>` slug is fallback only.
 
     `channel_message` is the body posted in the ticket channel (uses @mention
     for notification). `dm_message` is the body posted in DM fallback — if
@@ -2606,38 +2948,50 @@ async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | 
     - Cross-guild deduplication
     """
     dm_message = dm_message or channel_message
-    accelerate_usernames = await fetch_accelerate_usernames()
-    excluded_ids = await fetch_excluded_user_ids()
+    _, stage_index = await asyncio.gather(
+        fetch_accelerate_usernames(force=True),
+        fetch_stage_exclusions(force=True),
+    )
     pending = load_pending()
     sent_channel = 0
     sent_dm = 0
     skipped = 0
     dm_blocked = 0
     ineligible = 0
+    pending_skipped = 0
     no_channel = 0
     seen_users = set()  # Dedupe across guilds
 
     for guild in client.guilds:
+        _bind_checkin_records_to_guild(guild)
         for member in guild.members:
             if member.bot or member.id in seen_users:
                 continue
             seen_users.add(member.id)
-            if member.name.lower() not in accelerate_usernames:
+            member_record = checkin_member_record_for(guild, member)
+            if member_record is None:
                 continue
-            if not is_within_join_window(member):
-                ineligible += 1
+            result = evaluate_checkin_eligibility(
+                member,
+                member_record,
+                stage_index,
+                already_checked_in=has_checked_in(member.id),
+            )
+            if not result["eligible"]:
+                codes = {reason["code"] for reason in result["reasons"]}
+                if "already_checked_in" in codes:
+                    skipped += 1
+                else:
+                    ineligible += 1
+                print(f"[SKIP] {member.display_name} is ineligible ({','.join(sorted(codes))})")
                 continue
             if str(member.id) in pending:
-                continue
-            if is_advanced_stage(member.id, excluded_ids):
-                continue
-            if has_checked_in(member.id):
-                skipped += 1
+                pending_skipped += 1
                 continue
 
             # The reminder stays visible in the 1-1 ticket channel, while the
             # button opens the same private form used from DMs and /checkin.
-            candidates = _ticket_channels_for_username(guild, member.name.lower())
+            candidates = _ticket_channels_for_member(guild, member)
             ticket_channel = _pick_ticket_channel_for_confirmation(candidates)
 
             if ticket_channel is not None:
@@ -2689,7 +3043,7 @@ async def _send_checkin_dms(label: str, channel_message: str, dm_message: str | 
         f"[{label.upper()}] Channel: {sent_channel}, DM: {sent_dm} "
         f"(of {no_channel} with no ticket channel), "
         f"Skipped (checked in): {skipped}, DM-blocked: {dm_blocked}, "
-        f"Join-date filtered: {ineligible}"
+        f"Ineligible: {ineligible}, Pending sequence: {pending_skipped}"
     )
 
 
@@ -2892,17 +3246,23 @@ async def send_checkin_to_member(member: discord.Member, guild: discord.Guild, k
 
     Mirrors the scheduled job's routing: post in the member's 1-1 ticket
     channel (with @mention + Start Check-in button) when one exists, else fall
-    back to a DM. This is a manual CSM override, so it intentionally bypasses
-    the weekly-eligibility filters (join window / advanced stage / already
-    checked in) — the only thing it still respects is DM-blocked on the DM
-    fallback path. Returns a small result dict for the API response.
+    back to a DM. Manual sends use the same canonical eligibility decision as
+    scheduled sends and member entry surfaces. Returns a small result dict.
     """
     if kind == "midweek":
         channel_msg, dm_msg = _MIDWEEK_CHANNEL_MSG, _MIDWEEK_DM_MSG
     else:
         channel_msg, dm_msg = _WEEKLY_CHANNEL_MSG, _WEEKLY_DM_MSG
 
-    candidates = _ticket_channels_for_username(guild, (member.name or "").lower())
+    eligibility = await resolve_checkin_eligibility(member, guild, force=True)
+    if not eligibility["eligible"]:
+        return {
+            "ok": False,
+            "error": "ineligible",
+            "reasons": [reason["code"] for reason in eligibility["reasons"]],
+        }
+
+    candidates = _ticket_channels_for_member(guild, member)
     ticket_channel = _pick_ticket_channel_for_confirmation(candidates)
     if ticket_channel is not None:
         try:

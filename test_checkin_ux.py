@@ -21,30 +21,83 @@ class CheckinEntryTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(channel_type=channel_type):
                 user_id = 900_000 + offset
-                response = SimpleNamespace(send_message=AsyncMock())
+                response = SimpleNamespace(defer=AsyncMock())
+                followup = SimpleNamespace(send=AsyncMock())
                 interaction = SimpleNamespace(
                     user=SimpleNamespace(id=user_id),
                     channel=SimpleNamespace(type=channel_type),
+                    guild=None,
                     response=response,
+                    followup=followup,
                 )
 
-                with (
-                    patch.object(
-                        bot,
-                        "fetch_accelerate_usernames",
-                        new=AsyncMock(return_value=set()),
-                    ),
-                    patch.object(bot, "has_checked_in", return_value=False),
+                with patch.object(
+                    bot,
+                    "resolve_checkin_eligibility",
+                    new=AsyncMock(return_value={"eligible": True, "reasons": []}),
                 ):
                     await bot._dispatch_checkin_entry(interaction)
-                    await asyncio.sleep(0)
 
-                response.send_message.assert_awaited_once()
-                call = response.send_message.await_args
+                response.defer.assert_awaited_once()
+                followup.send.assert_awaited_once()
+                call = followup.send.await_args
                 self.assertIn("private form", call.args[0])
                 self.assertTrue(call.kwargs["ephemeral"])
                 self.assertIsInstance(call.kwargs["view"], bot.StageSelectView)
                 bot.release_checkin_lock(user_id)
+
+    async def test_ineligible_entry_is_blocked_before_form_opens(self):
+        response = SimpleNamespace(defer=AsyncMock())
+        followup = SimpleNamespace(send=AsyncMock())
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=8123),
+            guild=None,
+            response=response,
+            followup=followup,
+        )
+        blocked = {
+            "eligible": False,
+            "reasons": [{"code": "not_member", "message": "No member record."}],
+        }
+        with patch.object(
+            bot,
+            "resolve_checkin_eligibility",
+            new=AsyncMock(return_value=blocked),
+        ):
+            await bot._dispatch_checkin_entry(interaction)
+
+        call = followup.send.await_args
+        self.assertNotIn("view", call.kwargs)
+        self.assertIn("only available", call.args[0])
+
+    async def test_modal_rechecks_eligibility_before_saving(self):
+        modal = bot.CheckInModal(
+            selected_stage="1. Finding a Product",
+            weekly_hours="5–10 hours",
+            feeling="Locked in",
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=8456),
+            guild=None,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        blocked = {
+            "eligible": False,
+            "reasons": [{"code": "inactive_status", "message": "Your status is paused."}],
+        }
+        with (
+            patch.object(
+                bot,
+                "resolve_checkin_eligibility",
+                new=AsyncMock(return_value=blocked),
+            ),
+            patch.object(bot, "submit_checkin", new=AsyncMock()) as submit,
+        ):
+            await modal.on_submit(interaction)
+
+        submit.assert_not_awaited()
+        self.assertIn("only available", interaction.followup.send.await_args.args[0])
 
     def test_public_conversational_flow_is_not_available(self):
         self.assertFalse(hasattr(bot, "run_conversational_checkin"))
