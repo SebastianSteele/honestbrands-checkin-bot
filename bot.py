@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 load_dotenv()
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-CHECKIN_ELIGIBILITY_VERSION = "canonical-v1"
+CHECKIN_ELIGIBILITY_VERSION = "clickup-enrollment-v2"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
@@ -78,6 +78,9 @@ CU_FIELD_COACH = "3c4c9ce5-07f5-4aa3-a0bf-1dbca6c9efe3"
 
 # Canonical public storefront URL on the ClickUp Member Database.
 CU_FIELD_STORE_URL = "4166f954-1644-400c-9b0d-9d6e4a702ae9"
+
+# Canonical start date for the member's check-in eligibility window.
+CU_FIELD_ENROLLMENT_DATE = "fd103112-e82a-4545-b531-240f226385e6"
 
 # Program Name dropdown options (orderindex → name)
 PROGRAM_NAMES = {
@@ -143,10 +146,10 @@ STAGE_TO_MILESTONE = {
     "6. Scaling Brand": "5. Scaling",
 }
 
-# Eligibility for Accelerate and Accelerate Plus members who joined Discord on/after this
-# date AND are within their first CHECKIN_WEEKS_CAP weeks. After 12 weeks the
-# member rolls off the DM list automatically.
-MEMBER_JOIN_CUTOFF = datetime(2026, 3, 1, tzinfo=timezone.utc)
+# Eligibility for Accelerate and Accelerate Plus members whose ClickUp Enrollment
+# Date is on/after this date and within their first CHECKIN_WEEKS_CAP weeks.
+# Discord join dates are routing metadata only and never control eligibility.
+MEMBER_ENROLLMENT_CUTOFF = datetime(2026, 3, 1, tzinfo=timezone.utc)
 CHECKIN_WEEKS_CAP = 12
 
 # Total weekly DMs in the new-member sequence (overridden by NEW_MEMBER_TOTAL_STEPS env var in testing)
@@ -322,6 +325,7 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
                 program_name_val = None
                 discord_username = None
                 raw_store_url = ""
+                enrollment_date_value = None
                 status_name = (task.get("status") or {}).get("status", "")
                 for cf in task.get("custom_fields", []):
                     if cf.get("id") == CU_FIELD_PROGRAM_NAME:
@@ -330,6 +334,8 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
                         discord_username = (cf.get("value") or "").strip()
                     elif cf.get("id") == CU_FIELD_STORE_URL:
                         raw_store_url = (cf.get("value") or "").strip()
+                    elif cf.get("id") == CU_FIELD_ENROLLMENT_DATE:
+                        enrollment_date_value = cf.get("value")
                 is_accelerate = is_checkin_program_value(program_name_val)
                 if is_accelerate:
                     username_key = (discord_username or "").lower()
@@ -341,6 +347,7 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
                         "discord_username": discord_username or "",
                         "discord_username_key": username_key,
                         "store_url": raw_store_url,
+                        "enrolled_at": clickup_date_to_datetime(enrollment_date_value),
                     }
                     records.append(record)
                     if username_key:
@@ -393,7 +400,7 @@ async def fetch_accelerate_usernames(*, force: bool = False) -> set:
         # new check-in member is created without a Discord handle.
         print(
             f"[CLICKUP] WARN: {len(missing_username)} Accelerate / Accelerate Plus member(s) have a "
-            f"BLANK Discord username and will NOT receive check-in DMs:"
+            f"BLANK Discord username; 1:1 channel permission fallback will be attempted:"
         )
         for entry in missing_username[:20]:
             print(
@@ -420,21 +427,37 @@ def get_checkin_status_exclusions() -> list[dict]:
     return list(_accelerate_cache.get("excluded_status") or [])
 
 
-def is_within_join_window(member: discord.Member, *, now_utc: datetime | None = None) -> bool:
-    """Return True if the member is in their first CHECKIN_WEEKS_CAP weeks AND
-    joined Discord on or after MEMBER_JOIN_CUTOFF.
+def clickup_date_to_datetime(value) -> datetime | None:
+    """Parse a ClickUp millisecond date into a timezone-aware UTC datetime."""
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def is_within_enrollment_window(
+    member_record: dict,
+    *,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Return True when ClickUp Enrollment Date is inside the check-in window.
 
     The cohort scope is intentionally tight — coaching check-ins target newer
-    Accelerate and Accelerate Plus members through their first 12 weeks. After that they roll off
-    automatically.
+    Accelerate and Accelerate Plus members through their first 12 weeks.
     """
-    if member.joined_at is None:
+    enrolled_at = member_record.get("enrolled_at")
+    if enrolled_at is None:
         return False
-    if member.joined_at < MEMBER_JOIN_CUTOFF:
+    if enrolled_at.tzinfo is None:
+        enrolled_at = enrolled_at.replace(tzinfo=timezone.utc)
+    if enrolled_at < MEMBER_ENROLLMENT_CUTOFF:
         return False
     now_utc = now_utc or datetime.now(timezone.utc)
-    weeks_since_join = (now_utc - member.joined_at).days / 7
-    return weeks_since_join < CHECKIN_WEEKS_CAP
+    if enrolled_at > now_utc:
+        return False
+    return now_utc - enrolled_at < timedelta(weeks=CHECKIN_WEEKS_CAP)
 
 
 # --- ClickUp-based advanced-stage exclusion (submitted check-ins) ---
@@ -1087,11 +1110,22 @@ def _save_product_info(data: dict):
         json.dump(data, f, indent=2)
 
 
-def get_product_info(discord_username: str) -> dict | None:
+def get_product_info(discord_username: str, discord_user_id: int | None = None) -> dict | None:
     key = (discord_username or "").lower()
     saved = _load_product_info().get(key) or {}
     product_name = (saved.get("product_name") or "").strip()
     store_url = (_accelerate_cache.get("store_urls") or {}).get(key, "")
+    if discord_user_id is not None:
+        records = (_accelerate_cache.get("records_by_user_id") or {}).get(
+            str(discord_user_id),
+            [],
+        )
+        record = _best_checkin_member_record(records)
+        if record:
+            try:
+                store_url = normalize_store_url(record.get("store_url") or "")
+            except ValueError:
+                store_url = ""
     return {"product_name": product_name, "store_url": store_url} if (product_name or store_url) else None
 
 
@@ -1124,11 +1158,39 @@ def save_pending(data: dict):
 
 
 # --- ClickUp Member Database integration (async with aiohttp) ---
-async def find_member_by_discord(discord_username: str):
-    """Search the ClickUp Member Database for a member by Discord username."""
+async def find_member_by_discord(
+    discord_username: str,
+    discord_user_id: int | None = None,
+):
+    """Find a ClickUp member by stable Discord ID, then legacy username."""
     headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
     page = 0
     async with aiohttp.ClientSession() as session:
+        if discord_user_id is not None:
+            records = (_accelerate_cache.get("records_by_user_id") or {}).get(
+                str(discord_user_id),
+                [],
+            )
+            record = _best_checkin_member_record(records)
+            task_id = record.get("task_id") if record else None
+            if task_id:
+                try:
+                    async with session.get(
+                        f"https://api.clickup.com/api/v2/task/{task_id}",
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                        print(
+                            f"[CLICKUP] Stable-ID member lookup failed for "
+                            f"{discord_user_id}: {resp.status}; trying username"
+                        )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    print(
+                        f"[CLICKUP] Stable-ID member lookup error for "
+                        f"{discord_user_id}: {e}; trying username"
+                    )
         while True:
             try:
                 async with session.get(
@@ -1247,13 +1309,17 @@ async def update_member_profile(task_id: str, stage: str,
         print(f"[CLICKUP] Updated member profile: {task_id}")
 
 
-async def save_store_url_to_member_db(discord_username: str, store_url: str) -> bool:
+async def save_store_url_to_member_db(
+    discord_username: str,
+    store_url: str,
+    discord_user_id: int | None = None,
+) -> bool:
     """Write the normalized URL to the sole canonical ClickUp Store URL field."""
     normalized = normalize_store_url(store_url)
     if not normalized:
         return False
     try:
-        member_task = await find_member_by_discord(discord_username)
+        member_task = await find_member_by_discord(discord_username, discord_user_id)
     except Exception as e:
         print(f"[CLICKUP] Store URL lookup error for {discord_username}: {e}")
         return False
@@ -1280,6 +1346,9 @@ async def save_store_url_to_member_db(discord_username: str, store_url: str) -> 
             return False
 
     (_accelerate_cache.setdefault("store_urls", {}))[(discord_username or "").lower()] = normalized
+    for record in _accelerate_cache.get("records") or []:
+        if record.get("task_id") == task_id:
+            record["store_url"] = normalized
     print(f"[CLICKUP] Store URL saved to member {task_id}: {normalized}")
     return True
 
@@ -1349,7 +1418,10 @@ def _bind_checkin_records_to_guild(guild: discord.Guild) -> dict[str, list[dict]
 
     Exact current usernames are accepted for the initial association. When a
     username has changed, the explicit member permission on the legacy-named
-    1:1 channel supplies the stable ID. All later routing uses that ID.
+    1:1 channel supplies the stable ID. If ClickUp has no Discord username, an
+    exact normalized member-name/channel-name match provides the same bridge.
+    Shared couple channels bind every explicitly permitted member to the one
+    ClickUp plan record. All later routing uses stable Discord IDs.
     """
     if _accelerate_cache.get("bindings_guild_id") == guild.id:
         return _accelerate_cache.get("records_by_user_id") or {}
@@ -1370,14 +1442,12 @@ def _bind_checkin_records_to_guild(guild: discord.Guild) -> dict[str, list[dict]
 
     for record in records:
         username = record.get("discord_username_key") or ""
-        if not username:
-            continue
+        channel_identity = username or record.get("name") or ""
         owner_ids: set[int] = set()
-        for channel in _ticket_channels_for_username(guild, username):
+        for channel in _ticket_channels_for_username(guild, channel_identity):
             owner_ids.update(_explicit_ticket_member_ids(channel))
-        # Only trust an unambiguous explicit ticket owner.
-        if len(owner_ids) == 1:
-            owner_id = str(next(iter(owner_ids)))
+        for explicit_owner_id in owner_ids:
+            owner_id = str(explicit_owner_id)
             if record not in by_id.setdefault(owner_id, []):
                 by_id[owner_id].append(record)
 
@@ -1432,14 +1502,32 @@ def evaluate_checkin_eligibility(
                 "message": f"Your ClickUp member status is {status or 'not active'}.",
             })
 
-    joined_at = getattr(member, "joined_at", None)
     now_utc = now_utc or datetime.now(timezone.utc)
-    if joined_at is None:
-        reasons.append({"code": "missing_join_date", "message": "Your Discord join date could not be verified."})
-    elif joined_at < MEMBER_JOIN_CUTOFF:
-        reasons.append({"code": "before_cutoff", "message": "Your Discord join date is before the current check-in cohort."})
-    elif not is_within_join_window(member, now_utc=now_utc):
-        reasons.append({"code": "outside_window", "message": f"Your {CHECKIN_WEEKS_CAP}-week check-in window has ended."})
+    if member_record is not None:
+        enrolled_at = member_record.get("enrolled_at")
+        if enrolled_at is None:
+            reasons.append({
+                "code": "missing_enrollment_date",
+                "message": "Your ClickUp Enrollment Date is missing or invalid.",
+            })
+        else:
+            if enrolled_at.tzinfo is None:
+                enrolled_at = enrolled_at.replace(tzinfo=timezone.utc)
+            if enrolled_at < MEMBER_ENROLLMENT_CUTOFF:
+                reasons.append({
+                    "code": "before_cutoff",
+                    "message": "Your ClickUp Enrollment Date is before the current check-in cohort.",
+                })
+            elif enrolled_at > now_utc:
+                reasons.append({
+                    "code": "future_enrollment_date",
+                    "message": "Your ClickUp Enrollment Date is in the future.",
+                })
+            elif not is_within_enrollment_window(member_record, now_utc=now_utc):
+                reasons.append({
+                    "code": "outside_window",
+                    "message": f"Your {CHECKIN_WEEKS_CAP}-week check-in window has ended.",
+                })
 
     if is_advanced_stage(member, stage_index, member_record):
         reasons.append({"code": "advanced_stage", "message": "You have reached an advanced stage and no longer need weekly check-in reminders."})
@@ -1704,13 +1792,13 @@ async def post_checkin_to_ticket_channel(
             return
 
         coach_ping = ""
-        member_task = await find_member_by_discord(user.name)
+        member_task = await find_member_by_discord(user.name, user.id)
         if member_task:
             labels = _coach_assignee_labels(member_task)
             coach_ping = await _resolve_coach_mentions_async(guild, labels)
 
         if answers:
-            product = get_product_info(user.name)
+            product = get_product_info(user.name, user.id)
             body = format_ticket_checkin_summary(user.mention, answers, product)
         else:
             # No answers provided and not posted from this channel — fall back
@@ -2022,7 +2110,7 @@ async def submit_checkin(
     if step_num is not None:
         base_custom_fields.append({"id": CI_FIELD_ROADMAP_STEP, "value": step_num})
 
-    product = get_product_info(user.name)
+    product = get_product_info(user.name, user.id)
     product_lines = ""
     if product:
         pname = (product.get("product_name") or "").strip()
@@ -2077,6 +2165,7 @@ async def submit_checkin(
 
     asyncio.create_task(_update_member_after_checkin(
         discord_username=user.name,
+        discord_user_id=user.id,
         display_name=display_name,
         stage=stage,
         roadmap_step=roadmap_step,
@@ -2091,10 +2180,11 @@ async def submit_checkin(
 
 async def _update_member_after_checkin(discord_username, display_name, stage,
                                        weeks, blocker, help_needed, next_steps,
-                                       roadmap_step="", checkin_task_id=None):
+                                       roadmap_step="", checkin_task_id=None,
+                                       discord_user_id=None):
     """Background task to update ClickUp member profile and enrich check-in task."""
     try:
-        member_task = await find_member_by_discord(discord_username)
+        member_task = await find_member_by_discord(discord_username, discord_user_id)
         if member_task:
             await update_member_profile(
                 member_task["id"], stage,
@@ -2238,7 +2328,11 @@ class ProductInfoModal(discord.ui.Modal, title="Tell us about your product"):
             except ValueError as e:
                 store_url = ""
                 note = f"\n\n⚠️ Store URL was not saved: {e}."
-            if store_url and not await save_store_url_to_member_db(interaction.user.name, store_url):
+            if store_url and not await save_store_url_to_member_db(
+                interaction.user.name,
+                store_url,
+                interaction.user.id,
+            ):
                 note = "\n\n⚠️ Store URL could not be saved to ClickUp. You can try again next check-in."
 
         view = ContinueCheckinView(
@@ -2356,7 +2450,7 @@ class FeelingSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         feeling = self.values[0]
-        product = get_product_info(interaction.user.name) or {}
+        product = get_product_info(interaction.user.name, interaction.user.id) or {}
         needs_product_name = (
             _stage_requires_product_info(self.selected_stage)
             and not product.get("product_name")
@@ -2491,8 +2585,8 @@ async def checkin_status(interaction: discord.Interaction):
         member_record = checkin_member_record_for(interaction.guild, member)
         if member_record is None:
             continue
-        joined = member.joined_at
-        joined_str = joined.strftime("%b %d, %Y") if joined else "unknown"
+        enrolled = member_record.get("enrolled_at")
+        enrolled_str = enrolled.strftime("%b %d, %Y") if enrolled else "unknown"
         result = evaluate_checkin_eligibility(
             member,
             member_record,
@@ -2502,7 +2596,7 @@ async def checkin_status(interaction: discord.Interaction):
         reasons = [reason["message"] for reason in result["reasons"]]
         status = "✅" if result["eligible"] else "❌"
         reason_text = f" — {', '.join(reasons)}" if reasons else ""
-        lines.append(f"{status} **{member.display_name}** (joined {joined_str}){reason_text}")
+        lines.append(f"{status} **{member.display_name}** (enrolled {enrolled_str}){reason_text}")
 
     # Surface check-in members in ClickUp who are silently filtered out
     # because their Discord username field is blank.  These never appear in
@@ -2522,7 +2616,7 @@ async def checkin_status(interaction: discord.Interaction):
             more = f"\n... and {len(missing_dc) - 25} more"
         missing_block = (
             f"\n\n**Accelerate / Accelerate Plus members with BLANK Discord username "
-            f"(silently skipped — fix in ClickUp):** {len(missing_dc)}\n"
+            f"(1:1 permission fallback attempted; fix in ClickUp):** {len(missing_dc)}\n"
             + "\n".join(missing_lines)
             + more
         )
@@ -2555,8 +2649,8 @@ async def checkin_status(interaction: discord.Interaction):
 
     msg = (
         f"**Accelerate / Accelerate Plus Eligibility Report**\n"
-        f"(Source: ClickUp Program Name | Filter: joined "
-        f"≥ {MEMBER_JOIN_CUTOFF.strftime('%b %d, %Y')} "
+        f"(Source: ClickUp Program Name, Status, and Enrollment Date | Filter: enrolled "
+        f"≥ {MEMBER_ENROLLMENT_CUTOFF.strftime('%b %d, %Y')} "
         f"and within first {CHECKIN_WEEKS_CAP} weeks)\n\n"
         + "\n".join(lines)
         + missing_block

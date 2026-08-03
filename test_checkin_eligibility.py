@@ -53,6 +53,7 @@ def active_record(**overrides):
         "discord_username": "example",
         "discord_username_key": "example",
         "store_url": "",
+        "enrolled_at": datetime(2026, 7, 13, tzinfo=timezone.utc),
     }
     record.update(overrides)
     return record
@@ -100,11 +101,34 @@ class CanonicalEligibilityTests(unittest.TestCase):
                     {reason["code"] for reason in result["reasons"]},
                 )
 
-    def test_member_outside_join_window_is_blocked(self):
-        self.member.joined_at = self.now - timedelta(weeks=13)
-        result = self.evaluate(active_record())
+    def test_member_outside_enrollment_window_is_blocked(self):
+        result = self.evaluate(active_record(enrolled_at=self.now - timedelta(weeks=13)))
         self.assertFalse(result["eligible"])
         self.assertIn("outside_window", {reason["code"] for reason in result["reasons"]})
+
+    def test_discord_join_date_does_not_override_clickup_enrollment(self):
+        self.member.joined_at = self.now - timedelta(weeks=100)
+        result = self.evaluate(active_record(enrolled_at=self.now - timedelta(weeks=3)))
+        self.assertTrue(result["eligible"])
+
+        self.member.joined_at = self.now - timedelta(days=1)
+        result = self.evaluate(active_record(enrolled_at=self.now - timedelta(weeks=13)))
+        self.assertFalse(result["eligible"])
+        self.assertIn("outside_window", {reason["code"] for reason in result["reasons"]})
+
+    def test_missing_clickup_enrollment_date_is_blocked(self):
+        result = self.evaluate(active_record(enrolled_at=None))
+        self.assertFalse(result["eligible"])
+        self.assertIn(
+            "missing_enrollment_date",
+            {reason["code"] for reason in result["reasons"]},
+        )
+
+    def test_clickup_enrollment_date_parser_uses_milliseconds(self):
+        self.assertEqual(
+            bot.clickup_date_to_datetime("1773360000000"),
+            datetime(2026, 3, 13, tzinfo=timezone.utc),
+        )
 
     def test_already_checked_in_member_is_blocked(self):
         result = self.evaluate(active_record(), already_checked_in=True)
@@ -206,6 +230,33 @@ class StableTicketRoutingTests(unittest.TestCase):
             bot._accelerate_cache.clear()
             bot._accelerate_cache.update(old_cache)
 
+    def test_shared_couple_channel_binds_blank_username_record_to_both_ids(self):
+        neil = FakeMember(111, "neiltozer")
+        jennifer = FakeMember(222, "jennifertozer")
+        shared = FakeChannel(
+            "645-neiltozer",
+            {
+                neil: FakeOverwrite(True),
+                jennifer: FakeOverwrite(True),
+            },
+        )
+        guild = FakeGuild([neil, jennifer], [shared])
+        record = active_record(
+            name="Neil Tozer",
+            discord_username="",
+            discord_username_key="",
+        )
+        old_cache = dict(bot._accelerate_cache)
+        try:
+            bot._accelerate_cache["records"] = [record]
+            bot._accelerate_cache["records_by_user_id"] = {}
+            bot._accelerate_cache["bindings_guild_id"] = None
+            self.assertIs(bot.checkin_member_record_for(guild, neil), record)
+            self.assertIs(bot.checkin_member_record_for(guild, jennifer), record)
+        finally:
+            bot._accelerate_cache.clear()
+            bot._accelerate_cache.update(old_cache)
+
 
 class ReminderEligibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_reminders_send_only_after_canonical_eligibility_passes(self):
@@ -220,11 +271,15 @@ class ReminderEligibilityTests(unittest.IsolatedAsyncioTestCase):
         paused_channel = FakeChannel("2-paused", {paused: FakeOverwrite(True)})
         guild = FakeGuild([active, paused, outsider], [active_channel, paused_channel])
         records = {
-            active.id: active_record(discord_username_key="active"),
+            active.id: active_record(
+                discord_username_key="active",
+                enrolled_at=now - timedelta(weeks=2),
+            ),
             paused.id: active_record(
                 status="paused",
                 discord_username="paused",
                 discord_username_key="paused",
+                enrolled_at=now - timedelta(weeks=2),
             ),
         }
         fake_client = SimpleNamespace(guilds=[guild])
