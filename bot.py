@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 load_dotenv()
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+CHECKIN_ELIGIBILITY_VERSION = "canonical-v1"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
@@ -3326,7 +3327,11 @@ async def _handle_send_checkin(request: web.Request) -> web.Response:
 
 
 async def _handle_api_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "bot": str(client.user) if client.user else None})
+    return web.json_response({
+        "ok": True,
+        "bot": str(client.user) if client.user else None,
+        "checkin_eligibility": CHECKIN_ELIGIBILITY_VERSION,
+    })
 
 
 _api_started = False
