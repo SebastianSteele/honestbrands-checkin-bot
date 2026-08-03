@@ -6,7 +6,12 @@ os.environ.setdefault("DISCORD_TOKEN", "test")
 os.environ.setdefault("CLICKUP_TOKEN", "test")
 os.environ.setdefault("CLICKUP_LIST_ID", "test")
 
-from bot import is_checkin_program_value, normalize_store_url, program_name_from_value
+from bot import (
+    is_checkin_member_status,
+    is_checkin_program_value,
+    normalize_store_url,
+    program_name_from_value,
+)
 
 
 class StoreUrlTests(unittest.TestCase):
@@ -67,6 +72,28 @@ class ProgramEligibilityTests(unittest.TestCase):
         for value in (None, "", 0, 2, 3, 99, "unknown"):
             with self.subTest(value=value):
                 self.assertFalse(is_checkin_program_value(value))
+
+    def test_active_member_statuses_receive_checkins(self):
+        for status in ("active", "to do", "hand hold", "needs attention"):
+            with self.subTest(status=status):
+                self.assertTrue(is_checkin_member_status(status))
+
+    def test_inactive_member_statuses_do_not_receive_checkins(self):
+        for status in (
+            None,
+            "",
+            "paused",
+            "inactive",
+            "refunded",
+            "complete",
+            "graduated",
+            "cancelled",
+            "canceled",
+            "churned",
+            "offboarding",
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(is_checkin_member_status(status))
 
 
 if __name__ == "__main__":
